@@ -1,0 +1,933 @@
+"""Software-intern board + application tracker. Serves http://localhost:8000.
+Run: python3 board.py   (stdlib only)
+
+Sources:
+  - SimplifyJobs + SpeedyApply lists (their links also reveal company job boards)
+  - boards.json: company job boards found in Common Crawl by discover.py
+  - Every Greenhouse / Lever / Ashby / SmartRecruiters / Workable / Recruitee / Breezy / Gem / Teamtailor / Workday
+    board above, polled directly,
+    plus Amazon's jobs API.
+Hot boards (companies that list SWE interns) are checked every cycle (~40s; Workday ~6 min, it rate-limits);
+the long tail is checked every COLD_EVERY cycles.
+"""
+import calendar, html, json, os, re, sys, threading, time, urllib.error, urllib.request, zlib
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+
+from discover import board_of, OUT as DISCOVERED
+import signals as community
+
+HERE = Path(__file__).parent
+# Settings that must not live in code or git (e.g. the ntfy topic): KEY=VALUE lines in .env next to this file
+for line in (HERE / ".env").read_text().splitlines() if (HERE / ".env").exists() else []:
+    if "=" in line and not line.lstrip().startswith("#"):
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip())
+NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
+NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")  # empty = phone alerts off
+SITE_URL = os.environ.get("SITE_URL", "http://localhost:8000")
+
+
+def save(path, obj, **kw):
+    """Write JSON atomically (temp file + rename) so a reader or a crash never sees half a file."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(obj, **kw))
+    os.replace(tmp, path)
+TRACKER = HERE / "tracker.json"
+SEEN = HERE / "seen.json"  # first time we saw jobs whose source has no exact post time (Workday)
+MIN_CYCLE = 30  # seconds between sweep starts
+LISTS = ["https://raw.githubusercontent.com/SimplifyJobs/Summer2027-Internships/dev/.github/scripts/listings.json",
+         "https://raw.githubusercontent.com/SimplifyJobs/New-Grad-Positions/dev/.github/scripts/listings.json",
+         "https://raw.githubusercontent.com/vanshb03/Summer2027-Internships/dev/.github/scripts/listings.json"]
+SPEEDYAPPLY = ["https://raw.githubusercontent.com/speedyapply/2027-SWE-College-Jobs/main/README.md",
+               "https://raw.githubusercontent.com/speedyapply/2027-SWE-College-Jobs/main/INTERN_INTL.md"]
+COLD_EVERY = 10  # long-tail boards are checked every 10th cycle (~7 min fast loop, ~1 h Workday)
+DEAD_FOR = 86400  # a board that 404s is skipped for a day
+# Seeds so big names are covered even if they drop out of the lists.
+SEED = {"greenhouse": {"stripe", "airbnb", "databricks", "robinhood", "figma", "discord", "coinbase", "cloudflare",
+                       "roblox", "datadog", "anthropic", "pinterest", "lyft", "dropbox", "reddit", "asana", "brex"},
+        "lever": {"palantir", "plaid", "spotify"},
+        "ashby": {"ramp", "openai", "notion", "linear", "vercel", "perplexity", "cursor", "replit"},
+        "smartrecruiters": set(), "workday": set(), "workable": set(), "recruitee": set(),
+        "breezy": set(), "gem": set(), "teamtailor": set(), "icims": set(), "oracle": set(),
+        "successfactors": set(), "phenom": set(), "rippling": set()}
+
+INTERN = re.compile(r"\bintern(ship)?s?\b|\bco-?op\b", re.I)
+# Strictly software engineering: AI/ML/data roles only count if the title also says software/SWE/developer.
+SWE = re.compile(r"software|\bswe\b|\bsde\b|developer|back[- ]?end|front[- ]?end|full[- ]?stack|web (dev|eng)"
+                 r"|\bios\b|android|mobile (app|dev|eng)|programmer", re.I)
+NOT_SWE = re.compile(r"sales|marketing|recruit|business develop|account(ing|ant)|\bhr\b|legal|developer (relations|advocate)|asset management"
+                     r"|mechanical|electrical|civil|manufacturing|field eng|construction|biomedical|sales eng"
+                     r"|\b(ai|ml|data|bi)\b[\s/]*developer", re.I)
+# Titles that are often-but-not-always software: never excluded outright, never trusted outright. The job
+# description decides whether the work is mainly software (see desc_score).
+SOFT = re.compile(r"network|hardware|embedded|firmware|\bsystems?\b", re.I)
+# Tech programs that hide SWE work behind broad titles ("Technology Analyst Intern", "IT Application Development
+# Intern", "Engineering Intern"): shown only if the job description reads like software development.
+TECH = re.compile(r"technolog|\btech\b|\bit\b|information (systems|technology)|applications? (dev|eng|sys)|digital|computer science"
+                  r"|\bcs\b|automation|cloud|platform|product eng|devops|site reliability|\bsre\b|engineering intern"
+                  r"|rotational|development program", re.I)
+NOT_TECH = re.compile(r"help ?desk|desktop support|technician|clinical|nurs|pharm|audit|financ|supply chain|hr tech"
+                      r"|\bdata\b|analytics|machine learning|\bai\b|\bml\b|cyber|security"
+                      r"|consult|methods|property|project delivery|operations|solutions eng|general", re.I)
+LANGS = re.compile(r"python|\bjava\b|c\+\+|c#|\.net|javascript|typescript|golang|\bgo\b|kotlin|swift|rust|ruby|scala", re.I)
+# Strong software signals, grouped so one noisy group can't carry a score on its own.
+SIGNALS = {
+    "lang": LANGS,
+    "web": re.compile(r"\bapis?\b|rest(ful)?\b|graphql|microservices?|web (services|applications?)", re.I),
+    "stack": re.compile(r"back[- ]?end|front[- ]?end|full[- ]?stack|react|angular|vue|node\.?js|django|flask|spring boot|\.net core", re.I),
+    "db": re.compile(r"\bsql\b|postgres\w*|mysql|mongodb|nosql|databases?", re.I),
+    "vcs": re.compile(r"\bgit(hub|lab)?\b|version control|code reviews?", re.I),
+    "cloud": re.compile(r"\baws\b|azure|\bgcp\b|docker|kubernetes|ci/cd|devops", re.I),
+    "dev": re.compile(r"software (development|engineering)|develop(ing)? (software|applications|features)|write (clean )?code"
+                      r"|coding|programming|object[- ]oriented|unit test\w*|debug\w*|agile|scrum", re.I),
+}
+# Signals that the job is mostly something else (IT support, hardware bench work, network admin).
+NOT_SOFTWARE = re.compile(r"help ?desk|troubleshoot\w* (hardware|end[- ]user|laptops|printers)|desktop support|ticketing|imaging"
+                          r"|schematics?|\bpcb\b|circuit|oscilloscope|solder\w*|multimeter|\bfpga\b|verilog|vhdl|analog"
+                          r"|cabling|wiring|ccna|routers?\b|switch(es)? config\w*|lan/wan|test equipment|lab equipment", re.I)
+CODE = re.compile("|".join(p.pattern for p in SIGNALS.values()), re.I)
+ATS_HOSTS = re.compile(r"greenhouse|lever\.co|ashbyhq|smartrecruiters|myworkday|icims|workable|jobvite|oraclecloud"
+                       r"|eightfold|rippling|applytojob|bamboohr|recruitee|breezy|taleo|successfactors|dayforce|paylocity|adp")
+
+jobs, status = [], {"polled": 0, "boards": 0, "ok": 0}
+cache = {}   # (kind, board) -> last good job list; kept when a fetch fails so jobs don't flicker away
+lists, boards, names = [], {}, {}  # list-sourced jobs, discovered boards, (kind, board) -> company name
+sites, salaries = {}, {}  # company (lower) -> real website domain; dedupe key or company -> "$53/hr" (from SpeedyApply)
+first_seen = json.loads(SEEN.read_text()) if SEEN.exists() else {}  # url -> ts
+DETECTED = HERE / "detected.json"  # job url -> when this board first saw it (independent of the source's own date)
+detected = json.loads(DETECTED.read_text()) if DETECTED.exists() else {}
+health = {}  # (kind, board) -> {"ok": last success ts, "err": last error ts, "why": error, "ms": response ms, "n": jobs}
+CLOSED = HERE / "closed.json"  # url -> last known job + "closed" ts; shown as Closed for CLOSED_KEEP
+closed = json.loads(CLOSED.read_text()) if CLOSED.exists() else {}
+CLOSED_KEEP = 14 * 86400
+# Sources whose feed is a company's *complete* job list, so a job vanishing from it really means it closed.
+# (Keyword searches / newest-N feeds like Workday, iCIMS, Oracle, SuccessFactors can't tell closed from pushed out.)
+COMPLETE = {"greenhouse", "lever", "ashby", "workable", "recruitee", "breezy", "gem", "teamtailor", "rippling"}
+WATCH = HERE / "watch.json"  # starred companies (lowercase names)
+BATCH_WINDOW, BATCH_MIN = 3600, 4  # a company detecting 4+ new roles within an hour = batch drop
+SIGNALS_FILE = HERE / "signals.json"   # community signal id -> signal (kept 30 days)
+HISTORY = HERE / "history.json"   # company -> when it first posted a SWE internship last cycle (from Simplify's git history)
+sig_store = json.loads(SIGNALS_FILE.read_text()) if SIGNALS_FILE.exists() else {}
+page_seen = {}
+submissions = []  # "New Internship" GitHub issues: real postings, often before the lists merge them
+intern_activity = {}  # company (lower) -> non-SWE internship roles it detected in the last 30 days
+VERDICTS = HERE / "verdicts2.json"  # hidden-SWE job url -> {"s": 0-100 score, "why": [matched skills]} (checked once)
+verdicts = json.loads(VERDICTS.read_text()) if VERDICTS.exists() else {}
+hot, dead, cycles = set(), {}, {"fast": 0, "workday": 0, "workable": 0}
+shown_urls = {}  # url -> job currently on the board (for closed-job detection)  # boards with SWE intern roles; 404'd boards -> when
+tracker_lock = threading.Lock()
+
+
+def http(url, body=None, headers=None):
+    req = urllib.request.Request(url, json.dumps(body).encode() if body else None,
+                                 {"User-Agent": "Mozilla/5.0 internboard", "Content-Type": "application/json", **(headers or {})})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.load(r)
+
+
+def iso(s):
+    return int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp())
+
+
+def job(company, title, location, url, posted, source, approx=False):
+    """approx=True: source only gives the day ("Posted 3 Days Ago"), so the UI shows days, not hours.
+    posted=0: source gives no date at all."""
+    p = urlsplit(url)  # drop tracking params (Simplify appends ?utm_source=Simplify&ref=Simplify) -> clean ATS link
+    url = urlunsplit(p._replace(query=urlencode([(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
+                                                 if not re.fullmatch(r"utm_\w+|ref|gh_src", k)])))
+    location = re.sub(r"\s*(,\s*)+", ", ", (location or "").strip(" ,"))
+    return {"company": company, "title": title.strip(), "location": location, "url": url,
+            "posted": int(posted), "source": source, "approx": approx}
+
+
+def midnight(days_ago=0):
+    t = time.localtime(time.time() - 86400 * days_ago)
+    return time.mktime((t.tm_year, t.tm_mon, t.tm_mday, 0, 0, 0, 0, 0, -1))
+
+
+def speedyapply(url):
+    """Rows of the markdown tables: | <a href=site><strong>Co</strong></a> | Title | Location | [Salary |] <a href=apply> | 3d |"""
+    req = urllib.request.Request(url, headers={"User-Agent": "internboard"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        md = r.read().decode()
+    out = []
+    for line in md.splitlines():
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if not line.startswith("| <a") or len(cells) not in (5, 6):
+            continue
+        site, company = re.search(r'href="([^"]+)".*?<strong>(.*?)</strong>', cells[0]).groups()
+        apply = re.search(r'href="([^"]+)"', cells[-2]).group(1)
+        days = int(re.sub(r"\D", "", cells[-1]) or 0)
+        j = tag(job(company, cells[1], cells[2], apply, midnight(days), "SpeedyApply", True), desc={"s": 85, "why": ["SpeedyApply SWE list"]})
+        sites[company.lower()] = re.sub(r"^www\.", "", site.split("/")[2].lower())
+        if len(cells) == 6 and cells[3].startswith("$"):
+            salaries[dedupe_key(j)] = salaries[company.lower()] = cells[3]  # per role, and per company as fallback
+        out.append(j)
+    return out
+
+
+def fetch_lists():
+    out, boards, every = [], {k: set(v) for k, v in SEED.items()}, []
+    for u in LISTS:
+        every += [tag(job(j["company_name"], j["title"], ", ".join(j.get("locations", [])), j["url"], j["date_posted"], "Simplify")
+                      | {"terms": ", ".join(j.get("terms") or ([j["season"]] if j.get("season") else []))},
+                      desc={"s": 80, "why": ["Simplify: Software"]} if "Software" in (j.get("category") or "") else "")
+                  | {"live": j.get("active") and j.get("is_visible", True)} for j in http(u)]
+    out = [j for j in every if j.pop("live")]
+    live_urls = {j["url"] for j in out}
+    for j in every:  # a list marking a role inactive = closed
+        if j["url"] not in live_urls and j["url"] in shown_urls and j["url"] not in closed:
+            closed[j["url"]] = {**shown_urls[j["url"]], "closed": int(time.time())}
+    now, baseline = int(time.time()), not lists  # first load of the lists: their jobs aren't new to anyone
+    for j in out:
+        detected.setdefault(j["url"], j["posted"] if baseline else now)
+    out += [job(x["company"], x["title"], x["location"], x["url"], x["posted"], "GitHub")
+            for x in submissions if x["open"] and time.time() - x["posted"] < 30 * 86400]
+    for u in SPEEDYAPPLY:
+        try:
+            out += speedyapply(u)
+        except Exception as e:  # markdown layout can change; don't take the whole board down
+            print("speedyapply failed:", e, flush=True)
+    for j in every + out:  # every link, even to closed jobs, is a clue to a company job board worth polling
+        if key := board_of(j["url"]):
+            boards[key[0]].add(key[1])
+            names[key] = j["company"]
+            hot.add(key)  # companies on intern lists get checked every cycle
+    if DISCOVERED.exists():
+        for k, bs in json.loads(DISCOVERED.read_text()).items():
+            boards.setdefault(k, set()).update(tuple(b) if isinstance(b, list) else b for b in bs)
+    return out, boards
+
+
+def greenhouse(s):
+    return [tag(job(s, j["title"], j["location"]["name"], j["absolute_url"],
+                    iso(j.get("first_published") or j["updated_at"]), "Greenhouse"),
+                detail=f"https://boards-api.greenhouse.io/v1/boards/{s}/jobs/{j['id']}")
+            for j in http(f"https://boards-api.greenhouse.io/v1/boards/{s}/jobs")["jobs"]]
+
+
+def lever(s):
+    return [tag(job(s, j["text"], j["categories"].get("location"), j["hostedUrl"], j["createdAt"] / 1000, "Lever"),
+                desc=" ".join(texts([j.get("descriptionPlain"), j.get("lists")])))
+            for j in http(f"https://api.lever.co/v0/postings/{s}?mode=json")]
+
+
+def ashby(s):
+    return [tag(job(s, j["title"], j.get("location"), j["jobUrl"], iso(j["publishedAt"]), "Ashby"),
+                desc=j.get("descriptionPlain") or "")
+            for j in http(f"https://api.ashbyhq.com/posting-api/job-board/{s}")["jobs"]]
+
+
+def smartrecruiters(s):
+    content = {j["id"]: j for q in ("intern", "co-op")
+               for j in http(f"https://api.smartrecruiters.com/v1/companies/{s}/postings?q={q}&limit=100")["content"]}
+    return [tag(job(j["company"]["name"], j["name"], j["location"].get("fullLocation"),
+                    f"https://jobs.smartrecruiters.com/{s}/{j['id']}", iso(j["releasedDate"]), "SmartRecruiters"),
+                detail=f"https://api.smartrecruiters.com/v1/companies/{s}/postings/{j['id']}")
+            for j in content.values()]
+
+
+def workday(b):
+    """Workday only says "Posted Today / N Days Ago" (day precision; fetch() sharpens new ones to first-seen time)."""
+    tenant, wd, site = b
+    base = f"https://{tenant}.{wd}.myworkdayjobs.com"
+    # one page of the best matches per search; companies known to hire interns also get a "technology intern"
+    # search for tech programs. ponytail: a company with >20 matches per search loses the tail
+    posts = {}
+    for q in ["software intern"] + (["technology intern", "software co-op"] if ("workday", b) in hot else []):
+        for p in http(f"{base}/wday/cxs/{tenant}/{site}/jobs",
+                      {"appliedFacets": {}, "limit": 20, "offset": 0, "searchText": q}).get("jobPostings", []):
+            posts[p["externalPath"]] = p
+    out = []
+    for j in posts.values():
+        p = j.get("postedOn", "")
+        n = re.search(r"(\d+)", p)
+        posted = midnight(0 if "Today" in p else 1 if "Yesterday" in p else int(n.group(1)) if n else 30)
+        out.append(tag(job(tenant, j["title"], j.get("locationsText"), f"{base}/{site}{j['externalPath']}", posted, "Workday", True),
+                       detail=f"{base}/wday/cxs/{tenant}/{site}{j['externalPath']}"))
+    return out
+
+
+def workable(s):
+    d = http(f"https://apply.workable.com/api/v1/widget/accounts/{s}")
+    return [tag(job(d["name"], j["title"], ", ".join(filter(None, [j.get("city"), j.get("state"), j.get("country")])),
+                    j["url"], datetime.strptime(j["published_on"], "%Y-%m-%d").timestamp(), "Workable", True),
+                detail=f"https://apply.workable.com/api/v2/accounts/{s}/jobs/{j['shortcode']}")
+            for j in d["jobs"]]
+
+
+def recruitee(s):
+    return [tag(job(j.get("company_name") or s, j["title"], j.get("location"), j["careers_url"],
+                    iso(j["published_at"].replace(" UTC", "+00:00").replace(" ", "T")), "Recruitee"),
+                desc=(j.get("description") or "") + (j.get("requirements") or ""))
+            for j in http(f"https://{s}.recruitee.com/api/offers/")["offers"]]
+
+
+def amazon(_):
+    d = http("https://www.amazon.jobs/en/search.json?base_query=software%20intern&result_limit=100&sort=recent")
+    return [job("Amazon", j["title"], j["normalized_location"], "https://www.amazon.jobs" + j["job_path"],
+                datetime.strptime(j["posted_date"], "%B %d, %Y").timestamp(), "Amazon", True) for j in d["jobs"]]
+
+
+def breezy(s):
+    return [job(s, j["name"], (j.get("location") or {}).get("name"), j["url"], iso(j["published_date"]), "Breezy")
+            for j in http(f"https://{s}.breezy.hr/json")]
+
+
+def gem(s):
+    return [tag(job(s, j["title"], (j.get("location") or {}).get("name"), j["absolute_url"],
+                    iso(j.get("first_published_at") or j["created_at"]), "Gem"), desc=j.get("content_plain") or "")
+            for j in http(f"https://api.gem.com/job_board/v0/{s}/job_posts/")]
+
+
+def teamtailor(s):
+    out = []
+    for j in http(f"https://{s}.teamtailor.com/jobs.json")["items"]:
+        p = j.get("_jobposting") or {}
+        addr = ((p.get("jobLocation") or [{}])[0].get("address") or {})
+        loc = ", ".join(filter(None, [addr.get("addressLocality"), addr.get("addressCountry")]))
+        company = (p.get("hiringOrganization") or {}).get("name") or s
+        out.append(tag(job(company, j["title"], loc, j["url"], iso(j["date_published"]), "Teamtailor"),
+                       desc=j.get("content_html") or p.get("description") or ""))
+    return out
+
+
+def oracle(b):
+    """Oracle Recruiting Cloud's public candidate-experience API (newest first, day-precision dates)."""
+    host, site = b
+    reqs = {r["Id"]: r for q in ("intern", "co-op") for r in (http(
+        f"https://{host}/hcmRestApi/resources/latest/recruitingCEJobRequisitions?onlyData=true&expand=requisitionList"
+        f"&finder=findReqs;siteNumber={site},keyword={q},limit=50,sortBy=POSTING_DATES_DESC").get("items") or [{}])[0]
+        .get("requisitionList", [])}
+    return [tag(job(host.split(".")[0], r["Title"], r.get("PrimaryLocation"),
+                    f"https://{host}/hcmUI/CandidateExperience/en/sites/{site}/job/{r['Id']}",
+                    datetime.strptime(r["PostedDate"], "%Y-%m-%d").timestamp(), "Oracle", True),
+                desc=r.get("ShortDescriptionStr") or "")
+            for r in reqs.values()]
+
+
+def icims(sub):
+    """iCIMS has no JSON API; read its (stable) search-results HTML. No dates: fetch() times new ones on sight."""
+    page = ""
+    for q in ("intern", "co-op"):
+        req = urllib.request.Request(f"https://{sub}.icims.com/jobs/search?ss=1&searchKeyword={q}&in_iframe=1",
+                                     headers={"User-Agent": "Mozilla/5.0 internboard"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            page += r.read().decode("utf-8", "replace")
+    out, seen_links = [], set()
+    for card in page.split("iCIMS_JobCardItem")[1:]:
+        link = re.search(r'href="(https://[^"]+/jobs/\d+/[^"]+/job)', card)
+        title = re.search(r"<h3[^>]*>(.*?)</h3>", card, re.S)
+        if not (link and title) or link.group(1) in seen_links:
+            continue
+        seen_links.add(link.group(1))
+        loc = re.search(r"Job Locations</span>\s*<span[^>]*>(.*?)</span>", card, re.S)
+        desc = re.search(r'class="col-xs-12 description">(.*?)</div>', card, re.S)
+        out.append(tag(job(sub.removeprefix("careers-"), html.unescape(title.group(1)).strip(),
+                           html.unescape(loc.group(1)).strip() if loc else "", link.group(1), 0, "iCIMS", True),
+                       desc=desc.group(1) if desc else ""))
+    return out
+
+
+def successfactors(host):
+    """SAP SuccessFactors career sites (jobs.l3harris.com, careers.qorvo.com, ...): their RSS feed is the company's
+    20 newest jobs with full descriptions. ponytail: a company posting >20 jobs between two checks loses the overflow."""
+    req = urllib.request.Request(f"https://{host}/services/rss/job/?locale=en_US", headers={"User-Agent": "Mozilla/5.0 internboard"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        xml = r.read().decode("utf-8", "replace")
+    out = []
+    for it in re.findall(r"<item>(.*?)</item>", xml, re.S):
+        title = re.search(r"<title><!\[CDATA\[(.*?)\]\]>", it, re.S).group(1)
+        m = re.match(r"(.*?)\s*\(([^()]*)\)\s*$", title)
+        link = html.unescape(re.search(r"<link>(.*?)</link>", it).group(1))
+        when = datetime.strptime(re.search(r"<pubDate>(.*?)</pubDate>", it).group(1).strip(), "%a, %d %b %Y %H:%M:%S %Z")
+        desc = re.search(r"<description><!\[CDATA\[(.*?)\]\]>", it, re.S)
+        out.append(tag(job(host, m.group(1) if m else title, m.group(2) if m else "", link.split("?")[0],
+                           calendar.timegm(when.timetuple()), "SuccessFactors", True), desc=desc.group(1) if desc else ""))
+    return out
+
+
+def phenom(b):
+    """Phenom career sites (careers.cisco.com, careers.united.com, ...) embed their search results as JSON."""
+    host, prefix = b
+    out = {}
+    for q in ("software intern", "technology intern", "intern"):
+        req = urllib.request.Request(f"https://{host}/{prefix}/search-results?keywords={q.replace(' ', '%20')}",
+                                     headers={"User-Agent": "Mozilla/5.0 internboard"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            page = r.read().decode("utf-8", "replace")
+        ddo = re.search(r"phApp\.ddo = (\{.*?\});\s*phApp", page, re.S)
+        if not ddo:
+            raise ValueError("not a Phenom site")
+        for p in json.loads(ddo.group(1)).get("eagerLoadRefineSearch", {}).get("data", {}).get("jobs", []):
+            url = re.sub(r"/apply$", "", p.get("applyUrl") or "") or f"https://{host}/{prefix}/job/{p['jobId']}"
+            out[url] = tag(job(host, p["title"], p.get("location") or p.get("cityStateCountry"), url,
+                               iso(p["postedDate"]) if p.get("postedDate") else 0, "Phenom", True),
+                           desc=" ".join(texts([p.get("descriptionTeaser"), p.get("ml_skills")])))
+    return list(out.values())
+
+
+def rippling(slug):
+    d = http(f"https://ats.rippling.com/api/v2/board/{slug}/jobs?page=0&pageSize=100")
+    return [tag(job(slug, j["name"], "; ".join(l.get("name", "") for l in j.get("locations", [])), j["url"], 0, "Rippling", True),
+                detail=f"https://ats.rippling.com/api/v2/board/{slug}/jobs/{j['id']}") for j in d.get("items", [])]
+
+
+def tiktok(_):
+    """TikTok's careers API (no posting time: new ones are timed on sight)."""
+    out = {}
+    for q in ("software engineer intern", "software development intern", "frontend intern", "backend intern"):
+        d = http("https://api.lifeattiktok.com/api/v1/public/supplier/search/job/posts",
+                 {"keyword": q, "limit": 100, "offset": 0, "recruitment_id_list": [], "job_category_id_list": [],
+                  "subject_id_list": [], "location_code_list": []}, {"website-path": "tiktok"})
+        for p in d["data"]["job_post_list"]:
+            url = f"https://lifeattiktok.com/search/{p['id']}"
+            out[url] = tag(job("TikTok", p["title"], (p.get("city_info") or {}).get("en_name"), url, 0, "TikTok", True),
+                           desc=(p.get("description") or "") + (p.get("requirement") or ""))
+    return list(out.values())
+
+
+def google(_):
+    """Google's careers results page, newest intern roles. ponytail: parses Google's HTML (class names can change);
+    the Health tab will show it failing if they do."""
+    req = urllib.request.Request("https://www.google.com/about/careers/applications/jobs/results?q=software&"
+                                 "target_level=INTERN_AND_APPRENTICE&sort_by=date", headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        page = r.read().decode("utf-8", "replace")
+    out = []
+    for card in page.split('<h3 class="QJPWVe">')[1:]:
+        link = re.search(r"jobs/results/(\d+-[\w-]+)", card)
+        if not link:
+            continue
+        locs = [html.unescape(x).strip("; ") for x in re.findall(r'class="r0wTof[^"]*">([^<]+)', card)]
+        out.append(tag(job("Google", html.unescape(card.split("</h3>")[0]), " · ".join(dict.fromkeys(locs)),
+                           f"https://www.google.com/about/careers/applications/jobs/results/{link.group(1)}", 0, "Google", True),
+                       desc=re.sub(r"<[^>]+>", " ", card[:6000])))
+    if not out:
+        raise ValueError("Google careers layout changed")
+    return out
+
+
+FETCHERS = {"greenhouse": greenhouse, "lever": lever, "ashby": ashby, "smartrecruiters": smartrecruiters,
+            "workday": workday, "workable": workable, "recruitee": recruitee, "breezy": breezy, "gem": gem, "teamtailor": teamtailor, "oracle": oracle, "icims": icims, "amazon": amazon,
+            "successfactors": successfactors, "phenom": phenom, "rippling": rippling, "tiktok": tiktok, "google": google}
+WORKDAY_WORKERS = 4  # Workday returns 429 above a few concurrent requests; raise carefully
+
+
+def sharpen(key, res):
+    """Day-precision sources: a job that wasn't there on our previous check of this board was posted since then,
+    so record the time we first saw it (persisted in seen.json)."""
+    prev, now = cache.get(key), int(time.time())
+    prev_urls = {j["url"] for j in prev or ()}
+    for j in res:
+        if j["approx"] and prev is not None and j["url"] not in prev_urls and j["url"] not in first_seen \
+                and (j["posted"] >= midnight(1) or j["posted"] == 0):
+            first_seen[j["url"]] = now
+        if j["url"] in first_seen:
+            j["posted"], j["approx"] = first_seen[j["url"]], False
+    return res
+
+
+def fetch(key):
+    kind, b = key
+    h = health.setdefault(key, {})
+    for attempt in range(3):
+        t = time.time()
+        try:
+            res = FETCHERS[kind](b)
+            baseline = key not in cache  # first check of this board: its jobs aren't "new", just newly known
+            now = int(time.time())
+            for j in res:
+                if j["url"] not in detected and INTERN.search(j["title"]):  # only internships matter
+                    # first check of a board: its jobs aren't new. Dated ones keep their date; undated ones get 0
+                    # ("date unknown") so they never look fresh or trigger alerts/batches.
+                    detected[j["url"]] = j["posted"] if baseline else now
+            if kind in COMPLETE and key in cache:  # jobs that vanished from a complete feed have closed
+                gone = {j["url"] for j in cache[key]} - {j["url"] for j in res}
+                for j in cache[key]:
+                    if j["url"] in gone and j["url"] in shown_urls:
+                        closed[j["url"]] = {**shown_urls[j["url"]], "closed": now}
+            for j in res:
+                closed.pop(j["url"], None)  # reposted / reopened
+            cache[key] = sharpen(key, res)
+            h.update(ok=int(t), ms=int(1000 * (time.time() - t)), n=len(res))
+            return
+        except urllib.error.HTTPError as e:
+            h.update(err=int(t), why=f"HTTP {e.code}")
+            if e.code in (404, 410):
+                dead[key] = time.time()  # renamed/closed board
+            if e.code != 429:
+                return
+            time.sleep(5 * (attempt + 1))
+        except Exception as e:
+            h.update(err=int(t), why=type(e).__name__)
+            return
+
+
+def health_report():
+    """Per source system: how many boards we know, how many answered recently, what's failing."""
+    now, out = time.time(), {}
+    for (kind, b), h in list(health.items()):
+        r = out.setdefault(kind, {"known": len(boards.get(kind, ())), "checked": 0, "healthy": 0, "failing": 0,
+                                  "dead": 0, "listings": 0, "ms": [], "last_ok": 0, "errors": {}, "examples": []})
+        r["checked"] += 1
+        if h.get("ok", 0) >= h.get("err", 0):
+            r["healthy"] += 1
+            r["listings"] += h.get("n", 0)
+            r["ms"].append(h.get("ms", 0))
+            r["last_ok"] = max(r["last_ok"], h.get("ok", 0))
+        elif now - dead.get((kind, b), 0) < DEAD_FOR:
+            r["dead"] += 1
+        else:
+            r["failing"] += 1
+            r["errors"][h["why"]] = r["errors"].get(h["why"], 0) + 1
+            if len(r["examples"]) < 8:
+                r["examples"].append({"board": " / ".join(b) if isinstance(b, tuple) else b, "why": h["why"],
+                                      "since": h["err"], "last_ok": h.get("ok", 0)})
+    for r in out.values():
+        ms = sorted(r.pop("ms"))
+        r["median_ms"] = ms[len(ms) // 2] if ms else None
+    return out
+
+
+def due(key, cycle):
+    """Hot boards every cycle; the long tail staggered across COLD_EVERY cycles; dead boards skipped for a day.
+    ponytail: a long-tail company's *first* SWE posting can wait up to COLD_EVERY cycles; add more workers/servers
+    to lower COLD_EVERY."""
+    if time.time() - dead.get(key, 0) < DEAD_FOR:
+        return False
+    return key in hot or zlib.crc32(repr(key).encode()) % COLD_EVERY == cycle % COLD_EVERY
+
+
+def is_swe(j):
+    """Title alone is enough: clearly a software role."""
+    t = j["title"]
+    return bool(INTERN.search(t) and SWE.search(t) and not NOT_SWE.search(t) and not SOFT.search(t))
+
+
+def is_candidate(j):
+    """Title might be software (tech programs, or networking/hardware/embedded/firmware/systems roles); the job
+    description decides."""
+    t = j["title"]
+    if not INTERN.search(t) or NOT_SWE.search(t):
+        return False
+    if SOFT.search(t):
+        return True
+    return bool(TECH.search(t) and not SWE.search(t) and not NOT_TECH.search(t))
+
+
+PRETTY = {"apis": "APIs", "api": "APIs", "rest": "REST", "restful": "REST", "sql": "SQL", "aws": "AWS", "gcp": "GCP",
+          "ci/cd": "CI/CD", "git": "Git", "c++": "C++", "c#": "C#", ".net": ".NET", "javascript": "JavaScript",
+          "typescript": "TypeScript", "nodejs": "Node.js", "node.js": "Node.js"}
+SHOW_AT = 60  # minimum score to list a hidden-SWE role
+
+
+def desc_score(text):
+    """ponytail: keyword heuristic, not a model. Scores how strongly a description reads like software development:
+    - needs a programming language AND 2+ other signal groups (APIs, backend/frontend, databases, Git, cloud,
+      software-development practice), else capped below the SHOW_AT line;
+    - IT-support / hardware-bench / network-admin terms pull it down, and if they outnumber the software terms the
+      role is treated as mainly not software.
+    Returns (score, matched skills) so the UI can show *why*."""
+    text = html.unescape(re.sub(r"<[^>]+>", " ", html.unescape(text or "")))
+    found, groups = [], set()
+    for g, pat in SIGNALS.items():
+        for m in pat.finditer(text):
+            groups.add(g)
+            w = m.group().lower()
+            w = PRETTY.get(w, w if len(w) <= 3 else w.title())
+            if w not in found:
+                found.append(w)
+    negatives = len({m.group().lower() for m in NOT_SOFTWARE.finditer(text)})
+    others = len(groups - {"lang"})
+    score = 25 + 11 * others + 3 * min(len(found), 10) - 8 * negatives
+    if "lang" not in groups or others < 2:
+        score = min(score, SHOW_AT - 5)
+    if negatives > len(found) / 2:  # mostly support/hardware work that happens to mention some code
+        score = min(score, SHOW_AT - 10)
+    return max(0, min(99, score)), found[:6]
+
+
+def desc_ok(text):
+    return desc_score(text)[0] >= SHOW_AT
+
+
+def verdict(text):
+    s, why = desc_score(text)
+    return {"s": s, "why": why}
+
+
+def tag(j, desc=None, detail=None):
+    """For tech-program candidates: judge the description now if the feed includes it, else remember where to
+    fetch it (the verifier loop does that once per job)."""
+    if is_candidate(j) and j["url"] not in verdicts:
+        if isinstance(desc, dict):  # a curated list vouches for it...
+            if not (SOFT.search(j["title"]) and not SWE.search(j["title"])):  # ...but "Systems Engineer" needs a description
+                verdicts[j["url"]] = desc
+        elif desc is not None:
+            verdicts[j["url"]] = verdict(desc)
+        elif detail:
+            j["detail"] = detail
+    return j
+
+
+def texts(x):
+    """All strings inside a JSON response: detail endpoints nest the description differently per system."""
+    if isinstance(x, str):
+        yield x
+    elif isinstance(x, dict):
+        for v in x.values():
+            yield from texts(v)
+    elif isinstance(x, list):
+        for v in x:
+            yield from texts(v)
+
+
+def verify(j):
+    try:
+        verdicts[j["url"]] = verdict(" ".join(texts(http(j["detail"]))))
+    except urllib.error.HTTPError as e:
+        if e.code in (404, 410):
+            verdicts[j["url"]] = {"s": 0, "why": []}
+    except Exception:
+        pass  # retry next round
+
+
+def domain(company, url):
+    """Best guess at the company's website, for its logo. ponytail: name-based guess, wrong for some companies
+    (they fall back to a letter badge); a curated name->domain map fixes stragglers."""
+    if company.lower() in sites:
+        return sites[company.lower()]
+    host = re.sub(r"^(www|careers?|jobs|apply|recruiting|talent)\.", "", url.split("/")[2].lower())
+    if not ATS_HOSTS.search(host):
+        return ".".join(host.split(".")[-2:])
+    name = re.sub(r"\b(inc|llc|ltd|corp|corporation|company|co|group|holdings|the|plc)\b|[^a-z0-9 ]", "", company.lower())
+    return name.replace(" ", "") + ".com"
+
+
+NOISE = {"intern", "internship", "co", "op", "summer", "fall", "winter", "spring", "2026", "2027", "us", "usa", "the", "and", "hq"}
+CITY_ALIAS = {"nyc": "new york", "sf": "san francisco", "la": "los angeles"}
+
+
+def dedupe_key(j):
+    """Same company + same words (order, -ing, seasons ignored): "Software Engineering Intern, iOS - Summer 2027"
+    == "Software Engineer Intern - iOS"."""
+    words = re.sub(r"engineering", "engineer", j["title"].lower())
+    return j["company"].lower(), " ".join(sorted(set(re.findall(r"[a-z0-9+#]+", words)) - NOISE))
+
+
+def rebuild():
+    global jobs
+    out = {}
+    # direct-from-company results first so they win dedupe (exact timestamps, canonical links)
+    direct = [{**j, "company": names.get(k, j["company"][:1].upper() + j["company"][1:])} for k, r in list(cache.items()) for j in r]
+    shown = lambda j: is_swe(j) or (is_candidate(j) and verdicts.get(j["url"], {}).get("s", 0) >= SHOW_AT)
+    month_ago = time.time() - 30 * 86400
+    activity = {}
+    for j in direct:  # companies already posting (other) internships this season tend to post SWE soon
+        if INTERN.search(j["title"]) and not shown(j) and detected.get(j["url"], 0) > month_ago:
+            activity[j["company"].lower()] = activity.get(j["company"].lower(), 0) + 1
+    intern_activity.clear()
+    intern_activity.update(activity)
+    hot.update(k for k, r in list(cache.items()) if any(shown(j) for j in r))
+    for j in direct + lists:
+        if not shown(j):
+            continue
+        k = dedupe_key(j)
+        if k not in out:
+            ver = verdicts.get(j["url"], {}) if not is_swe(j) else {}
+            out[k] = {**{f: v for f, v in j.items() if f != "detail"}, "kind": "swe" if SWE.search(j["title"]) else "tech",
+                      "score": ver.get("s"), "why": ver.get("why", []), "detected": detected.get(j["url"], j["posted"]),
+                      "domain": domain(j["company"], j["url"]), "salary": salaries.get(k) or salaries.get(k[0], "")}
+        elif (city := re.split(r"[,;(]", j["location"])[0].strip()) \
+                and CITY_ALIAS.get(city.lower(), city.lower())[:6] not in out[k]["location"].lower():  # same role in another city: one card, merged locations
+            out[k]["location"] += " · " + city
+        if j.get("terms") and not out[k].get("terms"):  # direct copy wins, but keep the list's season label
+            out[k]["terms"] = j["terms"]
+    live = {j["url"] for j in out.values()}
+    now = time.time()
+    for u, c in list(closed.items()):  # recently closed roles stay visible (marked) unless a live copy exists
+        if now - c["closed"] > CLOSED_KEEP:
+            closed.pop(u, None)
+        elif u not in live and dedupe_key(c) not in out:
+            out[dedupe_key(c)] = c
+    jobs = sorted(out.values(), key=lambda j: -j["posted"])
+    shown_urls.clear()
+    shown_urls.update({j["url"]: j for j in jobs if "closed" not in j})
+    # batch drops: companies whose new roles landed together
+    recent = {}
+    for j in jobs:
+        if "closed" not in j and j["detected"] and now - j["detected"] < BATCH_WINDOW:
+            recent.setdefault(j["company"], []).append(j)
+    status["batches"] = sorted(({"company": c, "n": len(js), "since": min(j["detected"] for j in js), "domain": js[0]["domain"]}
+                                for c, js in recent.items() if len(js) >= BATCH_MIN), key=lambda b: -b["n"])
+    cutoff = time.time() - 60 * 86400
+    save(SEEN, {u: t for u, t in list(first_seen.items()) if t > cutoff})
+    save(VERDICTS, verdicts)
+    save(DETECTED, {u: t for u, t in list(detected.items()) if t > cutoff or u in live})
+    save(CLOSED, closed)
+    status.update(polled=int(time.time()), boards=sum(map(len, boards.values())) + 1, ok=len(cache))
+
+
+def run_loop(name, kinds, workers):
+    """Refresh the given board kinds forever, at most once per MIN_CYCLE."""
+    while True:
+        start = time.time()
+        try:
+            if name == "fast":  # the fast loop also refreshes the Simplify lists + board discovery
+                global lists, boards
+                lists, boards = fetch_lists()
+                boards.update(amazon={"amazon"}, tiktok={"tiktok"}, google={"google"})  # single-company sources
+            cycles[name] += 1
+            keys = [(k, b) for k in kinds for b in boards.get(k, ()) if due((k, b), cycles[name])]
+            with ThreadPoolExecutor(workers) as ex:
+                list(ex.map(fetch, keys))
+            rebuild()
+            send_alerts()
+            print(f"{time.strftime('%H:%M:%S')} {name}: {len(keys)} boards in {time.time() - start:.0f}s; "
+                  f"{len(jobs)} SWE internships", flush=True)
+        except Exception as e:
+            print(f"{name} loop failed:", e, flush=True)
+        time.sleep(max(0, MIN_CYCLE - (time.time() - start)))
+
+
+def verify_loop():
+    """Fetch descriptions for tech-program candidates, once each. Workday detail requests are few per cycle,
+    so they share Workday's budget without starving it."""
+    while True:
+        pending = [j for r in list(cache.values()) for j in r if "detail" in j and j["url"] not in verdicts]
+        slow = [j for j in pending if j["source"] in ("Workday", "Workable")][:40]
+        with ThreadPoolExecutor(8) as ex:
+            list(ex.map(verify, [j for j in pending if j["source"] not in ("Workday", "Workable")] + slow))
+        if pending:
+            rebuild()
+            print(f"{time.strftime('%H:%M:%S')} verify: {len(pending)} hidden-SWE descriptions pending, "
+                  f"{sum(v['s'] >= SHOW_AT for v in verdicts.values())} SWE-like so far", flush=True)
+        time.sleep(20)
+
+
+def build_history():
+    """Last cycle's first SWE-internship date per company, from Simplify's listings as of Dec 31 last year."""
+    if HISTORY.exists():
+        return {k.strip(): v for k, v in json.loads(HISTORY.read_text()).items()}
+    until = f"{time.gmtime().tm_year - 1}-12-31T00:00:00Z"
+    sha = http(f"https://api.github.com/repositories/266417772/commits?path=.github/scripts/listings.json&until={until}&per_page=1")[0]["sha"]
+    first = {}
+    for j in http(f"https://raw.githubusercontent.com/SimplifyJobs/Summer2027-Internships/{sha}/.github/scripts/listings.json"):
+        if j.get("category") in ("Software", "Software Engineering") and "Summer" in " ".join(j.get("terms") or ["Summer"]):
+            c = j["company_name"].strip()
+            first[c] = min(first.get(c, j["date_posted"]), j["date_posted"])
+    save(HISTORY, first)
+    return first
+
+
+history = {}
+
+
+def signals_loop():
+    """Every 10 min: Reddit, GitHub issues, watched pages -> community signals (+ GitHub posting submissions)."""
+    global history, submissions
+    while True:
+        try:
+            if not history:
+                history = build_history()
+            match = community.company_matcher({j["company"] for j in jobs} | set(history) | set(names.values()))
+            items = community.reddit()
+            gh, subs = community.github_issues()
+            submissions = subs
+            for it in items + gh + community.pages(page_seen):
+                for sg in community.extract(it, match):
+                    sig_store.setdefault(sg["id"], sg)
+            cutoff = time.time() - 30 * 86400
+            for k in [k for k, v in sig_store.items() if v["posted"] < cutoff]:
+                sig_store.pop(k)
+            save(SIGNALS_FILE, sig_store)
+            send_soon_alerts(likely_soon()["alerts"])
+            print(f"{time.strftime('%H:%M:%S')} signals: {len(items)} reddit, {len(gh)} github, {len(sig_store)} signals, "
+                  f"{sum(x['open'] for x in subs)} open submissions", flush=True)
+        except Exception as e:
+            print("signals loop failed:", e, flush=True)
+        time.sleep(600)
+
+
+def likely_soon():
+    """Likely Dropping Soon: last cycle's timing + this season's ATS activity + community signals, per company.
+    ponytail: hand-weighted score (history <=40, ATS <=20, community <=50), not a trained model."""
+    now = time.time()
+    open_now = {j["company"].lower() for j in jobs if j["kind"] == "swe" and "closed" not in j
+                and now - (j["posted"] or j["detected"] or now) < 150 * 86400 and "2026" not in j["title"]}
+    clusters = community.combine(list(sig_store.values()))
+    by_co = {}
+    for c in clusters:
+        by_co.setdefault(c["company"].lower(), []).append(c)
+    out = []
+    for co in set(map(str.lower, history)) | set(by_co) | set(intern_activity):
+        name = next((n for n in history if n.lower() == co), None) or (by_co.get(co) or [{}])[0].get("company") or co.title()
+        reasons, score, expected, source = [], 0, None, None
+        if co in open_now:
+            continue  # already dropped this cycle
+        if name in history:
+            last = datetime.fromtimestamp(history[name])
+            exp = last.replace(year=datetime.now().year)
+            delta = (exp.timestamp() - now) / 86400
+            if 0 <= delta <= 21:
+                score += 40 - 1.5 * delta
+                reasons.append(f"Last year posted SWE internships on {last:%b %-d}; expected in ~{delta:.0f} days")
+            elif -45 <= delta < 0:  # overdue: maybe soon, maybe not hiring this year
+                score += 22 + delta / 5
+                reasons.append(f"Last year posted on {last:%b %-d}; {-delta:.0f} days overdue and not open yet")
+            expected, source = exp.timestamp(), "history"
+        if n := intern_activity.get(co):
+            score += min(20, 5 * n)
+            reasons.append(f"Already posted {n} other internship role{'s' if n > 1 else ''} in the last 30 days")
+        upcoming = [c for c in by_co.get(co, []) if (c["claimed"] or c["latest"]) > now - 6 * 3600]
+        if upcoming:
+            best = max(upcoming, key=lambda c: c["confidence"])
+            score += 50 * best["confidence"]
+            reasons.append(f"{best['label']}: {len(best['signals'])} post{'s' if len(best['signals']) > 1 else ''} from "
+                           f"{best['independent']} independent source{'s' if best['independent'] > 1 else ''}")
+            if best["claimed"] and best["confidence"] >= 0.45:
+                expected, source = best["claimed"], best["label"]
+        if score >= 20:
+            out.append({"company": name, "score": round(min(99, score)), "expected": expected, "expected_from": source,
+                        "reasons": reasons, "domain": domain(name, "https://x/"), "clusters": by_co.get(co, [])})
+    alerts = [{"id": f"{c['company']}|{c['claimed']}", "company": c["company"], "claimed": c["claimed"], "label": c["label"],
+               "confidence": c["confidence"]} for c in clusters
+              if c["claimed"] and now <= c["claimed"] <= now + 36 * 3600
+              and (c["top_tier"] == "official" or c["confidence"] >= 0.7) and c["company"].lower() not in open_now]
+    return {"companies": sorted(out, key=lambda x: -x["score"]), "alerts": alerts,
+            "signals": sorted(sig_store.values(), key=lambda s: -s["posted"])[:300]}
+
+
+# ---------------------------------------------------------------- phone alerts (ntfy)
+NOTIFIED = HERE / "notified.json"  # what we've already alerted on, so restarts never re-send
+notified = set(json.loads(NOTIFIED.read_text())) if NOTIFIED.exists() else set()
+US = re.compile(r"united states|\busa?\b|remote|\d+ locations|,\s*(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|"
+                r"MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|DC)\b|\bsf\b|\bnyc\b|"
+                r"california|new york|texas|washington|massachusetts|illinois|georgia|virginia|colorado|new jersey", re.I)
+NON_US = re.compile(r"canada|united kingdom|\buk\b|india|germany|france|singapore|ireland|netherlands|poland|israel|china|"
+                    r"japan|australia|mexico|brazil|spain|italy|sweden|switzerland|romania|korea|taiwan|hong kong", re.I)
+GRAD = re.compile(r"\bph\.?d|master'?s|\bmba\b|\bm\.?s\.?\b|(?<!under)graduate student|\bgrad(uate)? (intern|program)", re.I)
+AGG_SOURCES = {"Simplify", "SpeedyApply", "GitHub"}
+MAX_PER_ROUND = 8  # more than this in one round becomes a single summary alert
+
+
+def ntfy(title, message, click=None, tags=(), priority=3):
+    """Publish via ntfy's JSON API (UTF-8 safe titles). No topic configured = no-op."""
+    if not NTFY_TOPIC:
+        return False
+    body = {"topic": NTFY_TOPIC, "title": title[:250], "message": message[:1000], "tags": list(tags), "priority": priority}
+    if click:
+        body["click"] = click
+    try:
+        urllib.request.urlopen(urllib.request.Request(NTFY_SERVER, json.dumps(body).encode(),
+                                                      {"Content-Type": "application/json"}), timeout=15)
+        return True
+    except Exception as e:
+        print("ntfy failed:", e, flush=True)
+        return False
+
+
+def is_priority(j, now):
+    """Same rule as the page: newly detected + US + undergrad + 2027 (or no year) + strong SWE match."""
+    loc, title = j.get("location", ""), j["title"]
+    years = set(re.findall(r"\b20(2[6-9])\b", title + " " + j.get("terms", "")))
+    strong = (j.get("score") is None or j["score"] >= 70) if j["kind"] == "swe" else (j.get("score") or 0) >= 80
+    return (j.get("detected") and now - j["detected"] < 30 * 60 and "closed" not in j
+            and (not loc or (US.search(loc) and not NON_US.search(loc))) and not GRAD.search(title)
+            and (not years or "27" in years) and strong)
+
+
+def send_alerts():
+    now = time.time()
+    watched = set(json.loads(WATCH.read_text())) if WATCH.exists() else set()
+    due = [j for j in jobs if j["url"] not in notified and "closed" not in j
+           and (is_priority(j, now) or (j["company"].lower() in watched and j.get("detected") and now - j["detected"] < 30 * 60))]
+    for j in due[:MAX_PER_ROUND]:
+        star = "★ " if j["company"].lower() in watched else ""
+        ntfy(f"{star}{j['company']}: {j['title']}", f"{j['location'] or 'Location not listed'}\nvia {j['source']}",
+             click=j["url"], tags=["briefcase"], priority=4)
+    if len(due) > MAX_PER_ROUND:
+        ntfy(f"+{len(due) - MAX_PER_ROUND} more new SWE internships", "Open the board to see them all.", click=SITE_URL, tags=["sparkles"])
+    for b in status.get("batches", []):
+        key = f"batch:{b['company']}:{int(b['since'] // 3600)}"
+        if key not in notified and ntfy(f"📦 Batch drop: {b['company']}", f"{b['n']} internships in the last hour",
+                                        click=f"{SITE_URL}/?q={quote(b['company'])}", tags=["package"], priority=4):
+            notified.add(key)
+    notified.update(j["url"] for j in due)
+    save(NOTIFIED, sorted(notified))
+
+
+def send_soon_alerts(alerts):
+    for a in alerts:
+        key = "soon:" + a["id"]
+        if key not in notified and ntfy(f"⏰ {a['company']} may open SWE internships soon",
+                                        f"{a['label']} ({round(a['confidence'] * 100)}% confidence)\n"
+                                        f"Claimed: {datetime.fromtimestamp(a['claimed']):%a %b %-d, %-I:%M %p}",
+                                        click=f"{SITE_URL}/#soon", tags=["alarm_clock"], priority=4):
+            notified.add(key)
+    save(NOTIFIED, sorted(notified))
+
+
+class H(BaseHTTPRequestHandler):
+    def send(self, body, ctype="application/json"):
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path.startswith("/api/jobs"):
+            if self.path.endswith(f"?v={status['polled']}"):  # page already has this version: nothing to send
+                self.send_response(204)
+                return self.end_headers()
+            self.send(json.dumps({**status, "jobs": jobs}).encode())
+        elif self.path == "/api/soon":
+            self.send(json.dumps(likely_soon()).encode())
+        elif self.path == "/api/health":
+            self.send(json.dumps(health_report()).encode())
+        elif self.path == "/api/tracker":
+            self.send(TRACKER.read_bytes() if TRACKER.exists() else b"[]")
+        elif self.path == "/api/watch":
+            self.send(WATCH.read_bytes() if WATCH.exists() else b"[]")
+        else:
+            self.send((HERE / "index.html").read_bytes(), "text/html; charset=utf-8")
+
+    def do_POST(self):  # whole tracker / watch list is replaced on each save (single user)
+        target = {"/api/tracker": TRACKER, "/api/watch": WATCH}.get(self.path)
+        if not target:
+            return self.send_error(404)
+        data = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if not isinstance(data, list):
+            return self.send_error(400)
+        with tracker_lock:
+            save(target, data, indent=1)
+        self.send(b"{}")
+
+    def log_message(self, *a):
+        pass
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["test-alert"]:  # python3 board.py test-alert: a real, current job, formatted like a real alert
+        for _ in range(30):  # right after a restart the board is still doing its first sweep
+            live = [j for j in json.load(urllib.request.urlopen("http://127.0.0.1:8000/api/jobs", timeout=15))["jobs"]
+                    if j["kind"] == "swe" and "closed" not in j]
+            if live:
+                break
+            time.sleep(5)
+        j = next((j for j in live if j["source"] not in AGG_SOURCES), live[0])  # prefer a company's own posting
+        ok = ntfy(f"{j['company']}: {j['title']}", f"{j['location'] or 'Location not listed'}\nvia {j['source']} · test alert",
+                  click=j["url"], tags=["white_check_mark"], priority=4)
+        sys.exit(print(f"sent: {j['company']}: {j['title']} -> {j['url']}" if ok else "not sent (is NTFY_TOPIC set in .env?)"))
+    threading.Thread(target=run_loop, args=("fast", ["greenhouse", "lever", "ashby", "smartrecruiters", "recruitee", "breezy", "gem", "teamtailor", "oracle", "icims", "amazon", "successfactors", "phenom", "rippling", "tiktok", "google"], 64), daemon=True).start()
+    threading.Thread(target=run_loop, args=("workable", ["workable"], 2), daemon=True).start()  # Cloudflare 1015s above that
+    threading.Thread(target=verify_loop, daemon=True).start()
+    threading.Thread(target=signals_loop, daemon=True).start()
+    threading.Thread(target=run_loop, args=("workday", ["workday"], WORKDAY_WORKERS), daemon=True).start()
+    print("http://localhost:8000", flush=True)
+    ThreadingHTTPServer(("127.0.0.1", 8000), H).serve_forever()

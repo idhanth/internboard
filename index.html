@@ -1,0 +1,488 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SWE Intern Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--fg:#101828;--mut:#667085;--line:#e4e7ec;--soft:#f2f4f7;--pri:#1e3a5f;--pri-fg:#fff;--new:#16a34a;--warn:#dc2626;--shadow:0 1px 2px rgba(16,24,40,.05)}
+@media(prefers-color-scheme:dark){:root{--bg:#0c0e12;--card:#161a21;--fg:#eef1f6;--mut:#98a2b3;--line:#262c36;--soft:#1f2530;--pri:#3b6ea5;--pri-fg:#fff;--new:#4ade80;--warn:#f87171;--shadow:none}}
+*{box-sizing:border-box}
+body{font:15px/1.4 Inter,system-ui,sans-serif;background:var(--bg);color:var(--fg);margin:0;overflow-wrap:anywhere}
+.wrap{max-width:1100px;margin:auto;padding:20px 16px 60px}
+svg.i{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex:none}
+header{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:18px}
+header h1{font-size:20px;margin:0 8px 0 0;letter-spacing:-.01em}
+nav{display:flex;background:var(--soft);border-radius:10px;padding:3px}
+nav button{background:none;border:0;color:var(--mut);font:inherit;font-weight:600;padding:6px 14px;border-radius:8px;cursor:pointer}
+nav button[aria-pressed=true]{background:var(--card);color:var(--fg);box-shadow:var(--shadow)}
+.spacer{flex:1}
+.btn{display:inline-flex;align-items:center;gap:6px;font:inherit;font-weight:600;font-size:14px;padding:9px 16px;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--fg);cursor:pointer;text-decoration:none;white-space:nowrap}
+.btn:hover{border-color:var(--mut)}
+.btn.pri{background:var(--pri);border-color:var(--pri);color:var(--pri-fg)}.btn.pri:hover{filter:brightness(1.12)}
+.btn.done{background:var(--soft);color:var(--mut);cursor:default}
+.stats{display:flex;gap:10px 24px;flex-wrap:wrap;align-items:center;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px 18px;box-shadow:var(--shadow)}
+.stats span{display:inline-flex;align-items:center;gap:8px;color:var(--mut)}.stats b{color:var(--fg);font-size:17px}
+.stats .ok{color:var(--new)}
+.filters{display:grid;grid-template-columns:auto 1.4fr 1fr auto;gap:10px;margin:16px 0 10px}
+.field{display:flex;align-items:center;gap:8px;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:0 12px;box-shadow:var(--shadow);min-width:0}
+.field:focus-within{border-color:var(--pri)}
+.field input,.field select{border:0;background:none;color:var(--fg);font:inherit;padding:11px 0;outline:none;width:100%;min-width:0}
+.field select{font-weight:600;cursor:pointer}
+.field .clear{background:none;border:0;color:var(--mut);cursor:pointer;font-size:18px;padding:0}
+.meta{display:flex;justify-content:space-between;align-items:center;color:var(--mut);margin:16px 2px 12px}
+.job{display:flex;gap:16px;align-items:center;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 20px;margin-bottom:12px;box-shadow:var(--shadow);transition:border-color .15s}
+.job:hover{border-color:var(--mut)}
+.logo{width:52px;height:52px;border-radius:12px;flex:none;object-fit:contain;background:#fff;border:1px solid var(--line);padding:6px}
+.logo.letter{display:grid;place-items:center;font-weight:700;font-size:22px;color:#fff;border:0;padding:0}
+.info{flex:1;min-width:0}
+.title{font-weight:600;font-size:16px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.badge{font-size:11px;font-weight:700;letter-spacing:.04em;color:var(--new);background:color-mix(in srgb,var(--new) 12%,transparent);padding:2px 8px;border-radius:999px}
+.badge.tech{color:var(--pri);background:color-mix(in srgb,var(--pri) 14%,transparent)}
+@media(prefers-color-scheme:dark){.badge.tech{color:#93c5fd}}
+.co{color:var(--mut);margin:2px 0 6px}
+.sub{display:flex;gap:6px 16px;flex-wrap:wrap;color:var(--mut);font-size:13.5px}.sub span{display:inline-flex;align-items:center;gap:5px}
+.acts{display:flex;gap:8px;flex:none}
+.pay{color:var(--new);font-weight:600}
+.pages{display:flex;gap:6px;justify-content:center;margin-top:18px;flex-wrap:wrap}
+.pages button{min-width:38px;justify-content:center}.pages button[aria-current=true]{background:var(--pri);color:var(--pri-fg);border-color:var(--pri)}
+.empty{text-align:center;color:var(--mut);padding:60px 0}
+@media(max-width:760px){header h1{font-size:18px}.filters{grid-template-columns:1fr 1fr}.filters .search,.filters .loc{grid-column:1/-1}.filters .search{order:-1}.filters .loc{order:1}
+ .stats{gap:8px 16px}.stats .spacer,#boards{display:none}.meta{flex-wrap:wrap;gap:8px}
+ .job{flex-wrap:wrap;padding:14px;gap:12px;align-items:flex-start}.job .logo{width:40px;height:40px;border-radius:10px;padding:4px}.job .logo.letter{font-size:17px}.acts{width:100%}.acts .btn{flex:1;justify-content:center}}
+/* tracker */
+.funnel{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:16px 0}
+.funnel div{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+.funnel b{font-size:24px;display:block}.funnel small{color:var(--mut)}
+.add{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px}.add .field{flex:1;min-width:150px}
+.kanban{display:grid;grid-template-columns:repeat(5,minmax(210px,1fr));gap:12px;overflow-x:auto;padding-bottom:8px}
+.col{background:var(--soft);border-radius:14px;padding:10px;min-height:320px}.col.over{outline:2px dashed var(--pri)}
+.col h3{font-size:12px;letter-spacing:.06em;color:var(--mut);margin:4px 4px 10px}
+.c{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px;margin-bottom:10px;cursor:grab;box-shadow:var(--shadow)}
+.c .top{display:flex;gap:10px;align-items:center}.c .top>div{flex:1;min-width:0;overflow-wrap:normal}.c .logo{width:34px;height:34px;border-radius:8px;padding:3px}.c .logo.letter{font-size:15px}
+.c .role{font-size:13px;margin-top:8px;line-height:1.35}.c a{color:inherit}.c input{width:100%;margin-top:6px;font:inherit;font-size:12.5px;padding:5px 7px;border:1px solid var(--line);border-radius:7px;background:var(--card);color:var(--fg)}
+.c .x{margin-left:auto;background:none;border:0;color:var(--mut);cursor:pointer}
+.due{font-size:12px;color:var(--mut);margin-top:6px}.late{color:var(--warn);font-weight:600}
+@media(max-width:760px){.funnel{grid-template-columns:repeat(3,1fr)}}
+.prefs{display:flex;gap:8px 18px;flex-wrap:wrap;align-items:center;color:var(--mut);font-size:14px;margin:4px 2px 0}
+.prefs label{display:inline-flex;gap:6px;align-items:center;cursor:pointer}
+.chips{display:flex;gap:6px;flex-wrap:wrap}.chips button{font:inherit;font-size:13px;padding:4px 10px;border-radius:999px;border:1px solid var(--line);background:var(--card);color:var(--fg);cursor:pointer}
+.chips button[aria-pressed=true]{background:var(--pri);color:var(--pri-fg);border-color:var(--pri)}
+.hint{color:var(--mut);background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 14px;margin:12px 0 0}
+.star{background:none;border:0;cursor:pointer;font-size:17px;color:var(--mut);padding:0 6px 0 0;line-height:1}.star.on{color:#f59e0b}
+.src{font-size:11.5px;font-weight:600;padding:1px 7px;border-radius:6px;margin-left:6px;white-space:nowrap}
+.src.direct{color:var(--new);background:color-mix(in srgb,var(--new) 10%,transparent)}.src.agg{color:var(--mut);background:var(--soft)}
+.job.closed{opacity:.55}.badge.closedb{color:var(--warn);background:color-mix(in srgb,var(--warn) 12%,transparent)}
+.batch{display:flex;gap:10px;align-items:center;background:color-mix(in srgb,#f59e0b 12%,var(--card));border:1px solid color-mix(in srgb,#f59e0b 40%,var(--line));border-radius:12px;padding:10px 14px;margin-top:12px;cursor:pointer}
+.batch img,.batch .logo{width:28px;height:28px;padding:2px;border-radius:7px}
+.badge.season{color:var(--mut);background:var(--soft);font-weight:600}
+.badge.hot{color:#ea580c;background:color-mix(in srgb,#ea580c 14%,transparent)}
+.why{font-size:12.5px;color:var(--mut);margin-top:4px}
+.htable{width:100%;border-collapse:collapse;background:var(--card);border-radius:12px;overflow:hidden;font-size:14px}
+.htable th,.htable td{padding:10px 12px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}
+.htable th:first-child,.htable td:first-child{text-align:left}.htable th{color:var(--mut);font-weight:600;font-size:12.5px}
+.bad{color:var(--warn);font-weight:600}.good{color:var(--new);font-weight:600}
+#health{overflow-x:auto}
+[hidden]{display:none!important}
+</style>
+
+<svg width="0" height="0" style="position:absolute">
+  <symbol id="i-pin" viewBox="0 0 24 24"><path d="M12 21s-7-6.2-7-11.5a7 7 0 0 1 14 0C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.5"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></symbol>
+  <symbol id="i-ext" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></symbol>
+  <symbol id="i-brief" viewBox="0 0 24 24"><rect x="3" y="7" width="18" height="13" rx="2"/><path d="M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2M3 13h18"/></symbol>
+  <symbol id="i-spark" viewBox="0 0 24 24"><path d="M12 3v4M12 17v4M3 12h4M17 12h4M6 6l2.5 2.5M15.5 15.5L18 18M6 18l2.5-2.5M15.5 8.5L18 6"/></symbol>
+  <symbol id="i-ok" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M8 12.5l3 3 5-6"/></symbol>
+  <symbol id="i-bell" viewBox="0 0 24 24"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10.3 21a1.9 1.9 0 0 0 3.4 0"/></symbol>
+</svg>
+
+<div class="wrap">
+<header>
+  <h1>SWE Intern Board</h1>
+  <nav><button id="tabBoard" aria-pressed="true">Board</button><button id="tabHidden" aria-pressed="false">Hidden SWE</button><button id="tabSoon" aria-pressed="false">Dropping Soon</button><button id="tabTrack" aria-pressed="false">Tracker</button><button id="tabHealth" aria-pressed="false">Health</button></nav>
+  <span class="spacer"></span>
+  <button class="btn" id="alerts"><svg class="i"><use href="#i-bell"/></svg><span>Enable alerts</span></button>
+</header>
+
+<section id="board">
+  <div class="stats">
+    <span><svg class="i"><use href="#i-brief"/></svg><b id="nActive">–</b> active</span>
+    <span><svg class="i" style="color:#f59e0b"><use href="#i-spark"/></svg><b id="nNew">–</b> new in 24h</span>
+    <span class="ok"><svg class="i"><use href="#i-ok"/></svg><span id="upd">Loading… first sweep takes ~1 min</span></span>
+    <span class="spacer"></span>
+    <span id="boards"></span>
+  </div>
+
+  <div id="batches"></div>
+  <div class="filters">
+    <label class="field"><select id="region"><option value="us">🇺🇸 US only</option><option value="">🌎 Anywhere</option></select></label>
+    <label class="field search"><svg class="i"><use href="#i-search"/></svg><input id="q" placeholder="Search title or company" autocomplete="off"><button class="clear" id="clearQ" hidden aria-label="Clear search">×</button></label>
+    <label class="field loc"><svg class="i"><use href="#i-pin"/></svg><input id="loc" placeholder="City, state, or Remote" autocomplete="off"></label>
+    <label class="field"><select id="sort"><option value="new">Newest</option><option value="old">Oldest</option><option value="az">Company A–Z</option><option value="score">Best SWE match</option></select></label>
+  </div>
+
+  <div class="prefs">
+    <label class="field" style="padding:0 10px"><select id="fSeason"><option value="">Any season</option><option value="Summer">Summer (incl. unlabeled)</option><option value="Fall">Fall</option><option value="Winter">Winter</option><option value="Spring">Spring</option><option value="Co-op">Co-op / off-cycle</option></select></label>
+    <label class="field" style="padding:0 10px"><select id="fYear"><option value="">Any year</option><option>2026</option><option selected>2027</option><option>2028</option></select></label>
+    <label><input type="checkbox" id="fUndergrad"> Undergrad (hide Master's/PhD/MBA)</label>
+    <label><input type="checkbox" id="fUnder"> Freshman/sophomore programs</label>
+    <label><input type="checkbox" id="fWatch"> ★ Watched only</label>
+    <label><input type="checkbox" id="fClosed"> Show closed</label>
+    <span class="chips" id="chips"><button data-loc="remote">Remote</button><button data-loc="atlanta">Atlanta</button><button data-loc="new york|nyc|new jersey|, nj|jersey city|hoboken|newark">NYC / NJ</button><button data-loc="">Nationwide</button></span>
+  </div>
+  <p class="hint" id="hiddenHint" hidden>Roles whose title doesn't say "software engineer" but whose description is software development: tech programs, application development, IT, and so on. The % is how strongly the description reads like SWE; hover a card to see the skills it matched.</p>
+  <div class="meta"><span id="showing"></span><span style="display:flex;gap:8px;flex-wrap:wrap">
+    <label class="field" style="padding:0 10px"><select id="kind"><option value="">SWE + hidden SWE</option><option value="swe">SWE titles only</option><option value="tech">Hidden SWE only</option></select></label>
+    <label class="field" style="padding:0 10px"><select id="age" aria-label="Freshness"><option value="">Any time</option><option value="0-5">0–5 min</option><option value="5-15">5–15 min</option><option value="15-60">15–60 min</option><option value="60-360">1–6 hr</option><option value="360-1440">6–24 hr</option><option value="1440-10080">1–7 days</option></select></label></span></div>
+  <div id="list"></div>
+  <div class="pages" id="pages"></div>
+</section>
+
+<section id="soon" hidden>
+  <p class="hint">Companies likely to open SWE internships soon, scored from <b>last cycle's timing</b>, <b>internships they've already
+  started posting this season</b>, and <b>community signals</b>. Community posts are evidence, not confirmation: a single Reddit post is
+  labeled a rumor, and confidence only rises when independent sources agree or the source is official.</p>
+  <div id="soonList"></div>
+  <h3 style="margin-top:28px">Community signals</h3>
+  <p class="mut" style="margin-top:-6px">From Reddit (r/csMajors, r/cscareerquestions, r/internships), GitHub internship repos, and any pages listed in <code>pages.json</code>.</p>
+  <div id="sigList" class="mut"></div>
+</section>
+
+<section id="health" hidden>
+  <p class="mut" id="healthSum"></p>
+  <table class="htable"><thead><tr><th>Source</th><th>Known boards</th><th>Checked</th><th>Healthy</th><th>Failing</th><th>Closed (skipped 24h)</th><th>Listings</th><th>Median response</th><th>Last success</th></tr></thead><tbody id="healthRows"></tbody></table>
+  <h3 style="margin-top:24px">Failing examples</h3><div id="healthFails" class="mut"></div>
+</section>
+
+<section id="track" hidden>
+  <div class="funnel" id="funnel"></div>
+  <form class="add" id="add">
+    <label class="field"><input name="company" placeholder="Company" required></label>
+    <label class="field"><input name="title" placeholder="Role" required></label>
+    <label class="field"><input name="url" placeholder="Link (optional)"></label>
+    <button class="btn pri"><svg class="i"><use href="#i-plus"/></svg>Add</button>
+  </form>
+  <div class="kanban" id="kanban"></div>
+</section>
+</div>
+
+<script>
+const STAGES = ['Interested', 'Applied', 'Interviewing', 'Offer', 'Rejected'];
+const PER_PAGE = 25;
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => '&#' + c.charCodeAt(0) + ';');
+const icon = n => `<svg class="i"><use href="#i-${n}"/></svg>`;
+const today = () => new Date().toLocaleDateString('en-CA');
+// Season/year come from the title plus Simplify's term label ("Fall 2026"). Nothing is dropped while scraping;
+// these only drive the season filter and the chip on each card.
+function season(j) {
+  const t = (j.title + ' ' + (j.terms || '')).toLowerCase(), s = [];
+  if (/summer/.test(t)) s.push('Summer');
+  if (/\bfall\b|autumn/.test(t)) s.push('Fall');
+  if (/winter/.test(t)) s.push('Winter');
+  if (/spring/.test(t)) s.push('Spring');
+  if (/co-?op|off[- ]cycle|\b\d{1,2}[- ]month/.test(t)) s.push('Co-op');
+  return { s, years: [...new Set(t.match(/\b20(2[6-9])\b/g) || [])] };
+}
+const seasonChip = j => { const { s, years } = season(j); return s.length || years.length ? `<span class="badge season">${[s.join('/'), years.join('/')].filter(Boolean).join(' ')}</span>` : ''; };
+const GRAD = /\bph\.?d|master'?s|\bmba\b|\bm\.?s\.?\b|(?<!under)graduate student|\bgrad(uate)? (intern|program)/i;
+const UNDER = /freshm[ae]n|sophomore|first[- ]year|second[- ]year|underclass|\bstep\b|explore|extern|early (career|insight)|discover/i;
+const US = /united states|\busa?\b|remote|\d+ locations|,\s*(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|DC)\b|alabama|alaska|arizona|arkansas|california|colorado|connecticut|delaware|florida|georgia|hawaii|idaho|illinois|indiana|iowa|kansas|kentucky|louisiana|maine|maryland|massachusetts|michigan|minnesota|mississippi|missouri|montana|nebraska|nevada|new hampshire|new jersey|new mexico|new york|north carolina|north dakota|ohio|oklahoma|oregon|pennsylvania|rhode island|south carolina|south dakota|tennessee|texas|utah|vermont|virginia|washington|wisconsin|wyoming|\bsf\b|\bnyc\b/i;
+const NON_US = /canada|united kingdom|\buk\b|india|germany|france|singapore|ireland|netherlands|poland|israel|china|japan|australia|mexico|brazil|spain|italy|sweden|switzerland|romania|philippines|korea|taiwan|vietnam|hong kong|\b(SGP|IND|GBR|CAN|DEU|FRA|IRL|NLD|POL|ISR|CHN|JPN|AUS|MEX|BRA|ESP|ITA)\b/i;
+
+function ago(t) {
+  const s = Date.now() / 1000 - t;
+  if (s < 60) return 'just now';
+  if (s < 3600) return Math.floor(s / 60) + ' min ago';
+  if (s < 86400) { const h = Math.floor(s / 3600); return h === 1 ? 'about 1 hour ago' : `about ${h} hours ago`; }
+  const d = Math.floor(s / 86400); return d === 1 ? '1 day ago' : d + ' days ago';
+}
+const HOT = 15 * 60;  // 🔥 = SWE title first detected in the last 15 minutes
+const posted = j => j.posted || j.detected;  // sources with no date: fall back to when we first saw it
+// when it dropped: the source's exact time if it has one, else when we first detected it
+const dropped = j => j.posted && !j.approx ? j.posted : j.detected;
+const AGG = new Set(['Simplify', 'SpeedyApply', 'GitHub']);
+let W = new Set();  // watched companies (lowercase)
+function shortLoc(l) { const p = l.split(' · '); return p.length > 3 ? p.slice(0, 3).join(' · ') + ` +${p.length - 3} more` : l; }
+function when(j) {  // human time since posted; day-level sources never pretend to know the hour
+  if (!j.posted) return j.detected ? 'detected ' + ago(j.detected) : 'date unknown';
+  const s = Date.now() / 1000 - j.posted, d = Math.floor((new Date().setHours(0, 0, 0, 0) / 1000 - j.posted) / 86400) + 1;
+  if (j.approx) return d <= 0 ? 'today' : d === 1 ? 'yesterday' : d + ' days ago';
+  if (s < 60) return 'just now';
+  if (s < 3600) return Math.floor(s / 60) + ' min ago';
+  if (s < 86400) { const h = Math.floor(s / 3600); return h === 1 ? 'about 1 hour ago' : `about ${h} hours ago`; }
+  const days = Math.floor(s / 86400); return days === 1 ? '1 day ago' : days + ' days ago';
+}
+const stamp = j => (j.posted ? 'Posted ' + new Date(j.posted * 1000)[j.approx ? 'toLocaleDateString' : 'toLocaleString']() + ' · ' : '') +
+  (j.detected ? 'First detected ' + new Date(j.detected * 1000).toLocaleString() : 'Already listed when this board started watching it');
+// show "detected" beside "posted" when our first sighting says more than the source's date
+const detNote = j => j.posted && j.detected && (j.approx || j.detected - j.posted > 3600) && Date.now() / 1000 - j.detected < 7 * 86400
+  ? ` · detected <span class="ago" data-d="1" data-i="${J.indexOf(j)}">${ago(j.detected)}</span>` : '';
+
+// logos: Google's favicon service; unknown domains come back as a 16px globe, so swap those for a letter badge
+function logo(company, domain) {
+  return `<img class="logo" alt="" loading="lazy" src="https://www.google.com/s2/favicons?domain=${encodeURIComponent(domain || '')}&sz=128"
+    data-name="${esc(company)}" onload="this.naturalWidth<=16&&letter(this)" onerror="letter(this)">`;
+}
+function letter(img) {
+  const n = img.dataset.name || '?', div = document.createElement('div');
+  let h = 0; for (const ch of n) h = (h * 31 + ch.charCodeAt(0)) % 360;
+  div.className = img.className + ' letter'; div.style.background = `hsl(${h} 45% 45%)`; div.textContent = n.trim()[0]?.toUpperCase() || '?';
+  img.replaceWith(div);
+}
+
+let J = [], S = {}, seen = null, T = [], page = 1, fresh = new Set();
+
+// ---------- board ----------
+async function loadJobs() {
+  try {
+    const r = await fetch('/api/jobs?v=' + (S.polled || 0));
+    if (r.status === 204) return;  // nothing new since last check
+    S = await r.json();
+    const added = seen ? S.jobs.filter(j => !seen.has(j.url)) : [];
+    seen = new Set([...(seen || []), ...S.jobs.map(j => j.url)]);
+    added.forEach(j => fresh.add(j.url));
+    J = S.jobs;
+    if (added.length) {
+      document.title = `(${fresh.size}) SWE Intern Board`;
+      if (window.Notification?.permission === 'granted') {
+        const list = a => a.slice(0, 3).map(j => `${j.company}: ${j.title}`).join('\n');
+        const watched = added.filter(j => W.has(j.company.toLowerCase()) && !j.closed);
+        const top = added.filter(j => priority(j) && !watched.includes(j));
+        if (watched.length) new Notification(`★ ${watched.length} new from companies you watch`, { body: list(watched) });
+        if (top.length) new Notification(`🔥 ${top.length} priority SWE internship${top.length > 1 ? 's' : ''}`, { body: list(top) });
+      }
+    }
+    if (window.Notification?.permission === 'granted')
+      for (const b of S.batches || []) if (!alertedBatches.has(b.company)) {
+        alertedBatches.add(b.company);
+        if (seen.size && added.length) new Notification(`📦 Batch drop: ${b.company}`, { body: `${b.n} internships in the last hour` });
+      }
+    drawBatches();
+    drawBoard();
+    if (!$('track').hidden) drawTracker();
+  } catch { $('upd').textContent = 'Server unreachable, is board.py running?'; }
+}
+
+function seasonOk(j, want, year) {
+  const { s, years } = season(j);
+  if (year && years.length && !years.includes(year)) return false;  // roles that don't name a year stay in
+  if (!want) return true;
+  return want === 'Summer' ? s.includes('Summer') || !s.length : s.includes(want) || (want === 'Co-op' && s.some(x => x !== 'Summer'));
+}
+
+function filtered() {
+  const words = $('q').value.toLowerCase().split(/\s+/).filter(Boolean), loc = $('loc').value.toLowerCase().trim();
+  const us = $('region').value === 'us', kind = $('kind').value, now = Date.now() / 1000;
+  const [lo, hi] = $('age').value ? $('age').value.split('-').map(m => +m * 60) : [0, Infinity];
+  const watchedOnly = $('fWatch').checked, showClosed = $('fClosed').checked;
+  const locs = loc.split('|').map(s => s.trim()).filter(Boolean);
+  const want = $('fSeason').value, year = $('fYear').value, undergrad = $('fUndergrad').checked, under = $('fUnder').checked;
+  const r = J.filter(j => {
+    const hay = (j.title + ' ' + j.company).toLowerCase();
+    return words.every(w => hay.includes(w)) && (!locs.length || locs.some(l => j.location.toLowerCase().includes(l))) &&
+      (!us || (US.test(j.location) && !NON_US.test(j.location)) || !j.location) && (now - dropped(j) >= lo && now - dropped(j) < hi) && (!kind || j.kind === kind) &&
+      (!watchedOnly || W.has(j.company.toLowerCase())) && (showClosed || !j.closed) &&
+      (!undergrad || !GRAD.test(j.title)) && (!under || UNDER.test(j.title)) && seasonOk(j, want, year);
+  });
+  const sort = $('sort').value;
+  if (sort === 'az') return r.sort((a, b) => a.company.localeCompare(b.company));
+  if (sort === 'score') return r.sort((a, b) => (b.score ?? 100) - (a.score ?? 100) || posted(b) - posted(a));
+  r.sort((a, b) => posted(b) - posted(a));
+  return sort === 'old' ? r.reverse() : r;
+}
+
+function drawBoard() {
+  if (!S.polled) return;
+  const r = filtered(), pages = Math.max(1, Math.ceil(r.length / PER_PAGE));
+  page = Math.min(page, pages);
+  const tracked = new Set(T.map(c => c.url)), now = Date.now() / 1000, from = (page - 1) * PER_PAGE;
+  $('nActive').textContent = J.length.toLocaleString();
+  $('nNew').textContent = J.filter(j => now - posted(j) < 86400).length.toLocaleString();
+  $('boards').textContent = `${S.ok.toLocaleString()} company job boards`;
+  $('showing').textContent = r.length ? `Showing ${from + 1}–${Math.min(from + PER_PAGE, r.length)} of ${r.length.toLocaleString()}` : '';
+  $('list').innerHTML = r.slice(from, from + PER_PAGE).map(j => `<article class="job${j.closed ? ' closed' : ''}">
+    ${logo(j.company, j.domain)}
+    <div class="info">
+      <div class="title">${esc(j.title)} ${j.closed ? `<span class="badge closedb">Closed ${ago(j.closed)}</span>` : ''}${j.kind === 'swe' && now - j.detected < HOT ? `<span class="badge hot">🔥 Just dropped</span>` : now - posted(j) < 86400 || fresh.has(j.url) ? `<span class="badge">🆕 NEW</span>` : ''}${j.kind === 'tech' ? `<span class="badge tech" title="Title isn't SWE, but the description is software development">Hidden SWE ${j.score ?? ''}%</span>` : ''}${seasonChip(j)}</div>
+      <div class="co"><button class="star${W.has(j.company.toLowerCase()) ? ' on' : ''}" data-star="${esc(j.company)}" aria-label="Watch ${esc(j.company)}" title="Watch this company">${W.has(j.company.toLowerCase()) ? '★' : '☆'}</button>${esc(j.company)}
+        <span class="src ${AGG.has(j.source) ? 'agg' : 'direct'}" title="${AGG.has(j.source) ? 'Found through an aggregator list; the link still goes to the company\'s own page' : 'Read directly from the company\'s own job system'}">${AGG.has(j.source) ? 'Via ' + esc(j.source) : 'Direct · ' + esc(j.source)}</span></div>
+      <div class="sub">${j.location ? `<span title="${esc(j.location)}">${icon('pin')}${esc(shortLoc(j.location))}</span>` : ''}<span title="${esc(stamp(j))} · via ${esc(j.source)}">${icon('clock')}<span class="ago" data-i="${J.indexOf(j)}">${when(j)}</span>${detNote(j)}</span>${j.salary ? `<span class="pay">${esc(j.salary)}</span>` : ''}</div>
+      ${j.kind === 'tech' && j.why?.length ? `<div class="why">${j.why.map(esc).join(' · ')}</div>` : ''}
+    </div>
+    <div class="acts">
+      ${tracked.has(j.url) ? `<span class="btn done">${icon('check')}Tracked</span>` : `<button class="btn pri" data-track="${esc(j.url)}">${icon('plus')}Track</button>`}
+      <a class="btn" href="${esc(j.url)}" target="_blank" rel="noopener">${icon('ext')}Apply</a>
+    </div></article>`).join('') || `<p class="empty">No internships match those filters.</p>`;
+  const nums = [...new Set([1, page - 1, page, page + 1, pages])].filter(p => p >= 1 && p <= pages).sort((a, b) => a - b);
+  $('pages').innerHTML = pages < 2 ? '' : `<button class="btn" data-page="${page - 1}" ${page === 1 ? 'disabled' : ''}>‹</button>` +
+    nums.map((p, i) => (i && p - nums[i - 1] > 1 ? '<span class="btn done">…</span>' : '') + `<button class="btn" data-page="${p}" aria-current="${p === page}">${p}</button>`).join('') +
+    `<button class="btn" data-page="${page + 1}" ${page === pages ? 'disabled' : ''}>›</button>`;
+  tickUpdated();
+}
+
+function tickUpdated() {
+  if (!S.polled) return;
+  const s = Math.max(0, Math.round(Date.now() / 1000 - S.polled));
+  $('upd').textContent = `Updated ${s < 60 ? s + 's' : Math.floor(s / 60) + 'm'} ago`;
+  document.querySelectorAll('.ago').forEach(el => { const j = J[el.dataset.i]; if (j) el.textContent = el.dataset.d ? ago(j.detected) : when(j); });  // live "posted X ago"
+}
+
+$('list').onclick = e => {
+  const st = e.target.closest('[data-star]');
+  if (st) {
+    const c = st.dataset.star.toLowerCase(); W.has(c) ? W.delete(c) : W.add(c);
+    fetch('/api/watch', { method: 'POST', body: JSON.stringify([...W]) }); drawBoard(); return;
+  }
+  const b = e.target.closest('[data-track]'); if (!b) return;
+  const j = J.find(j => j.url === b.dataset.track);
+  addCard({ company: j.company, title: j.title, url: j.url, domain: j.domain });
+};
+$('pages').onclick = e => { const b = e.target.closest('[data-page]'); if (b && !b.disabled) { page = +b.dataset.page; drawBoard(); scrollTo({ top: 0, behavior: 'smooth' }); } };
+const refilter = () => { page = 1; $('clearQ').hidden = !$('q').value; savePrefs(); drawBoard(); };
+['q', 'loc'].forEach(id => $(id).oninput = refilter);
+['region', 'sort', 'age', 'kind', 'fSeason', 'fYear', 'fUndergrad', 'fUnder', 'fWatch', 'fClosed'].forEach(id => $(id).onchange = refilter);
+$('chips').onclick = e => {
+  const b = e.target.closest('[data-loc]'); if (!b) return;
+  $('loc').value = b.dataset.loc; [...$('chips').children].forEach(x => x.ariaPressed = x === b && !!b.dataset.loc); refilter();
+};
+// remember personal filters on this device
+const PREFS = ['fSeason', 'fYear', 'fUndergrad', 'fUnder', 'region', 'loc'];
+try { const p = JSON.parse(localStorage.getItem('prefs') || '{}'); PREFS.forEach(k => { if (k in p) $(k)[$(k).type === 'checkbox' ? 'checked' : 'value'] = p[k]; }); } catch {}
+const savePrefs = () => { try { localStorage.setItem('prefs', JSON.stringify(Object.fromEntries(PREFS.map(k => [k, $(k).type === 'checkbox' ? $(k).checked : $(k).value])))); } catch {} };
+$('clearQ').onclick = e => { e.preventDefault(); $('q').value = ''; refilter(); };
+
+// ---------- tracker ----------
+async function loadWatch() { try { W = new Set(await (await fetch('/api/watch')).json()); } catch {} }
+function drawBatches() {
+  $('batches').innerHTML = (S.batches || []).map(b => `<div class="batch" data-co="${esc(b.company)}">${logo(b.company, b.domain)}
+    <span>📦 <b>Batch drop:</b> ${esc(b.company)} posted <b>${b.n}</b> internships in the last hour (first ${ago(b.since)})</span></div>`).join('');
+}
+$('batches').onclick = e => { const b = e.target.closest('[data-co]'); if (b) { $('q').value = b.dataset.co; refilter(); } };
+// Alert only for what matters: newly detected + US + undergrad + 2027 (or unstated) + strong SWE, or a watched
+// company, or a batch drop. Everything else still shows on the board, it just doesn't ping you.
+const strong = j => j.kind === 'swe' ? (j.score == null || j.score >= 70) : j.score >= 80;
+const priority = j => !j.closed && (US.test(j.location) && !NON_US.test(j.location) || !j.location) && !GRAD.test(j.title)
+  && seasonOk(j, '', '2027') && strong(j) && Date.now() / 1000 - j.detected < 30 * 60;
+let alertedBatches = new Set();
+async function loadTracker() { T = await (await fetch('/api/tracker')).json(); drawTracker(); remind(); }
+const save = () => fetch('/api/tracker', { method: 'POST', body: JSON.stringify(T) });
+
+function addCard(c) {
+  T.push({ id: crypto.randomUUID(), stage: 'Interested', due: '', note: '', added: today(), ...c });
+  save(); drawTracker(); drawBoard();
+}
+
+function drawTracker() {
+  const count = s => T.filter(c => c.stage === s).length;
+  // funnel: how many reached each stage or beyond (Rejected excluded)
+  const reached = i => T.filter(c => STAGES.indexOf(c.stage) >= i && c.stage !== 'Rejected').length;
+  $('funnel').innerHTML = STAGES.slice(0, 4).map((s, i) => `<div><small>${s}</small><b>${count(s)}</b>
+    <small>${!i ? T.length + ' total' : reached(i - 1) ? Math.round(100 * reached(i) / reached(i - 1)) + '% from prev' : '—'}</small></div>`).join('')
+    + `<div><small>Rejected</small><b>${count('Rejected')}</b><small>&nbsp;</small></div>`;
+  $('kanban').innerHTML = STAGES.map(s => `<div class="col" data-stage="${s}"><h3>${s.toUpperCase()} · ${count(s)}</h3>` +
+    T.filter(c => c.stage === s).map(c => `<div class="c" draggable="true" data-id="${c.id}">
+      <div class="top">${logo(c.company, c.domain || c.company.toLowerCase().replace(/[^a-z0-9]/g, '') + '.com')}
+        <div><b>${esc(c.company)}</b></div>
+        <button class="x" data-del="${c.id}" aria-label="Remove">✕</button></div>
+      <div class="role">${c.url ? `<a href="${esc(c.url)}" target="_blank" rel="noopener">${esc(c.title)}</a>` : esc(c.title)}</div>
+      ${J.some(j => j.url === c.url && j.closed) ? `<div class="due late">Posting closed</div>` : ''}
+      ${c.due ? `<div class="due ${c.due <= today() ? 'late' : ''}">Due ${c.due}</div>` : ''}
+      <input type="date" value="${esc(c.due)}" data-f="due" aria-label="Deadline or follow-up date">
+      <input value="${esc(c.note)}" data-f="note" placeholder="Note (OA due, recruiter…)"></div>`).join('') + '</div>').join('');
+}
+
+const K = $('kanban');
+K.ondragstart = e => e.dataTransfer.setData('text', e.target.dataset.id);
+K.ondragover = e => { const col = e.target.closest('.col'); if (col) { e.preventDefault(); col.classList.add('over'); } };
+K.ondragleave = e => e.target.closest('.col')?.classList.remove('over');
+K.ondrop = e => {
+  const col = e.target.closest('.col'); if (!col) return;
+  e.preventDefault();
+  const c = T.find(c => c.id === e.dataTransfer.getData('text'));
+  if (c) { c.stage = col.dataset.stage; save(); drawTracker(); }
+};
+K.onchange = e => {
+  const f = e.target.dataset.f; if (!f) return;
+  T.find(c => c.id === e.target.closest('.c').dataset.id)[f] = e.target.value;
+  save(); if (f === 'due') drawTracker();
+};
+K.onclick = e => { const id = e.target.dataset.del; if (id && confirm('Remove this card?')) { T = T.filter(c => c.id !== id); save(); drawTracker(); drawBoard(); } };
+$('add').onsubmit = e => { e.preventDefault(); addCard(Object.fromEntries(new FormData(e.target))); e.target.reset(); };
+
+function remind() {  // once per page load: deadlines due today or overdue
+  const due = T.filter(c => c.due && c.due <= today() && !['Offer', 'Rejected'].includes(c.stage));
+  if (due.length && window.Notification?.permission === 'granted')
+    new Notification(`${due.length} application deadline${due.length > 1 ? 's' : ''} due`, { body: due.map(c => `${c.company}: ${c.title} (${c.due})`).join('\n') });
+}
+
+// ---------- tabs / misc ----------
+function tab(t) {
+  $('board').hidden = !['board', 'hidden'].includes(t); $('track').hidden = t !== 'track'; $('health').hidden = t !== 'health';
+  $('soon').hidden = t !== 'soon';
+  ['Board', 'Hidden', 'Soon', 'Track', 'Health'].forEach(n => $('tab' + n).ariaPressed = t === n.toLowerCase());
+  if (t === 'soon') loadSoon();
+  $('hiddenHint').hidden = t !== 'hidden';
+  if (t === 'hidden' || t === 'board') { $('kind').value = t === 'hidden' ? 'tech' : ''; $('sort').value = t === 'hidden' ? 'score' : 'new'; refilter(); }
+  if (t === 'health') loadHealth();
+}
+$('tabBoard').onclick = () => tab('board'); $('tabHidden').onclick = () => tab('hidden');
+$('tabTrack').onclick = () => tab('track'); $('tabSoon').onclick = () => tab('soon'); $('tabHealth').onclick = () => tab('health');
+
+const fmtWhen = (ts, precision) => !ts ? 'soon (no date given)' : new Date(ts * 1000).toLocaleString([], precision === 'time'
+  ? { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' } : { weekday: 'short', month: 'short', day: 'numeric' })
+  + (precision === 'week' ? ' (that week)' : '');
+const until = ts => { const d = (ts - Date.now() / 1000) / 86400; return d < -1 ? `${Math.round(-d)} days ago` : d < 0 ? 'today' : d < 1 ? `in ${Math.max(1, Math.round(d * 24))} h` : `in ${Math.round(d)} days`; };
+const tierClass = t => ({ official: 'good', university: 'good', employee: '', community: 'mut' })[t];
+let seenSoonAlerts = new Set(JSON.parse((() => { try { return localStorage.getItem('soonAlerts') || '[]'; } catch { return '[]'; } })()));
+async function loadSoon(notifyOnly) {
+  const D = await (await fetch('/api/soon')).json();
+  for (const a of D.alerts) if (!seenSoonAlerts.has(a.id)) {  // high-confidence "opens within ~a day" community signal
+    seenSoonAlerts.add(a.id);
+    if (window.Notification?.permission === 'granted')
+      new Notification(`⏰ ${a.company} may open SWE internships ${until(a.claimed)}`, { body: `${a.label} (${Math.round(a.confidence * 100)}% confidence) · ${fmtWhen(a.claimed, 'time')}` });
+  }
+  try { localStorage.setItem('soonAlerts', JSON.stringify([...seenSoonAlerts])); } catch {}
+  if (notifyOnly) return;
+  $('soonList').innerHTML = D.companies.slice(0, 60).map(c => `<article class="job">${logo(c.company, c.domain)}
+    <div class="info"><div class="title">${esc(c.company)} <span class="badge ${c.score >= 60 ? 'hot' : 'season'}">${c.score}% likely</span>
+      ${c.expected ? `<span class="badge season">${c.expected_from === 'history' ? 'expected' : esc(c.expected_from)}: ${fmtWhen(c.expected)} · ${until(c.expected)}</span>` : ''}</div>
+      <div class="why">${c.reasons.map(esc).join('<br>')}</div></div>
+    <div class="acts"><button class="btn" data-star="${esc(c.company)}">${W.has(c.company.toLowerCase()) ? '★ Watching' : '☆ Watch'}</button></div></article>`).join('')
+    || '<p class="empty">Nothing looks imminent right now.</p>';
+  $('sigList').innerHTML = D.signals.length ? `<table class="htable"><thead><tr><th>Company</th><th>Role / program</th><th>Claimed drop</th><th>Source</th><th>Trust</th><th>Confidence</th><th>Posted</th><th>Evidence</th></tr></thead><tbody>` +
+    D.signals.map(s => `<tr><td><b>${esc(s.company)}</b></td><td>${esc(s.role)}</td><td>${fmtWhen(s.claimed, s.precision)}</td><td>${esc(s.source)}</td>
+      <td class="${tierClass(s.tier)}">${esc(s.tier_label)}${s.cites_recruiter ? ' · cites recruiter' : ''}</td><td>${Math.round(s.confidence * 100)}%</td>
+      <td>${ago(s.posted)}</td><td style="white-space:normal;text-align:left;max-width:360px"><a href="${esc(s.link)}" target="_blank" rel="noopener">${esc(s.evidence)}</a></td></tr>`).join('') + '</tbody></table>'
+    : 'No signals yet: the feeds are checked every 10 minutes.';
+}
+$('soonList').onclick = e => {
+  const st = e.target.closest('[data-star]'); if (!st) return;
+  const c = st.dataset.star.toLowerCase(); W.has(c) ? W.delete(c) : W.add(c);
+  fetch('/api/watch', { method: 'POST', body: JSON.stringify([...W]) }); loadSoon();
+};
+setInterval(() => loadSoon(!$('soon').hidden ? false : true), 60000);
+
+async function loadHealth() {
+  const H = await (await fetch('/api/health')).json(), rows = Object.entries(H).sort((a, b) => b[1].known - a[1].known);
+  const tot = rows.reduce((t, [, r]) => ({ c: t.c + r.checked, h: t.h + r.healthy }), { c: 0, h: 0 });
+  $('healthSum').innerHTML = `<b class="${tot.h / tot.c > .8 ? 'good' : 'bad'}">${tot.h.toLocaleString()} / ${tot.c.toLocaleString()}</b> checked sources healthy · closed boards are skipped for a day, and boards not yet checked are the long tail waiting their turn`;
+  $('healthRows').innerHTML = rows.map(([k, r]) => `<tr><td><b>${k}</b></td><td>${r.known.toLocaleString()}</td><td>${r.checked.toLocaleString()}</td>
+    <td class="good">${r.healthy.toLocaleString()}</td><td class="${r.failing ? 'bad' : ''}">${r.failing.toLocaleString()}</td><td>${r.dead.toLocaleString()}</td>
+    <td>${r.listings.toLocaleString()}</td><td>${r.median_ms ?? '–'} ms</td><td>${r.last_ok ? ago(r.last_ok) : '–'}</td></tr>`).join('');
+  $('healthFails').innerHTML = rows.filter(([, r]) => r.failing).map(([k, r]) => `<p><b>${k}</b>: ${Object.entries(r.errors).map(([e, n]) => `${n}× ${esc(e)}`).join(', ')}<br>
+    ${r.examples.map(x => `${esc(x.board)} (${esc(x.why)}, last OK ${x.last_ok ? ago(x.last_ok) : 'never'})`).join(' · ')}</p>`).join('') || 'None 🎉';
+}
+const alertLabel = () => $('alerts').lastChild.textContent = Notification.permission === 'granted' ? 'Alerts on' : Notification.permission === 'denied' ? 'Alerts blocked' : 'Enable alerts';
+if (window.Notification) { alertLabel(); $('alerts').onclick = async () => { await Notification.requestPermission(); alertLabel(); }; } else $('alerts').hidden = true;
+onfocus = () => { document.title = 'SWE Intern Board'; fresh.clear(); };
+
+// links from phone alerts: ?q=Company (batch drops) and #soon (Dropping Soon)
+const qp = new URLSearchParams(location.search).get('q'); if (qp) $('q').value = qp;
+Promise.all([loadTracker(), loadWatch()]).then(loadJobs).then(() => { if (location.hash === '#soon') tab('soon'); });
+setInterval(() => { loadJobs(); if (!$('health').hidden) loadHealth(); }, 5000);
+setInterval(tickUpdated, 1000);
+</script>

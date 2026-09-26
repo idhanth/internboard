@@ -1,0 +1,10 @@
+# secrets
+.env
+.site-login
+# runtime data
+*.json
+!pages.json
+*.log
+*.err
+__pycache__/
+*.txt
