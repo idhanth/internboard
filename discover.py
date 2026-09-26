@@ -28,6 +28,7 @@ PATTERNS = {
     # company-hosted career sites, recognised by their URL shape (found via the lists; a wrong guess just 404s)
     "successfactors": r"//([\w.-]+)/job/[^/?#]+/\d{7,}/",
     "phenom": r"//([\w.-]+)/((?:global|[a-z]{2})/[a-z]{2})/job/[\w-]+",
+    "jibe": r"//(?!www\.)([\w.-]+)/jobs/\d+\?(?:.*&)?icims=1",  # iCIMS/Jibe on the company's own domain
 }
 PATTERNS["smartrecruiters"] = r"(?:jobs|careers)\.smartrecruiters\.com/(?!oneclick|sr-jobs)([\w-]+)"
 
@@ -38,7 +39,11 @@ def board_of(url):
     if (m := re.search(r"//(?:www\.|careers\.|jobs\.)?([\w-]+)\.\w+/[^?#]*\?(?:.*&)?gh_jid=\d+", url)) \
             and "greenhouse" not in url:  # Greenhouse embedded on the company's own site: guess the board from the domain
         return "greenhouse", m.group(1).lower()
+    if (m := re.search(PATTERNS["jibe"], url)) and not m.group(1).endswith(".icims.com"):
+        return "jibe", m.group(1).lower()
     for k, pat in PATTERNS.items():
+        if k == "jibe":
+            continue
         if m := re.search(pat, url):
             if k == "workdaysite":  # same tenants, other hostname; the normal Workday API serves them
                 wd, tenant, site = m.groups()

@@ -53,7 +53,14 @@ SEED = {"greenhouse": {"stripe", "airbnb", "databricks", "robinhood", "figma", "
         "ashby": {"ramp", "openai", "notion", "linear", "vercel", "perplexity", "cursor", "replit"},
         "smartrecruiters": set(), "workday": set(), "workable": set(), "recruitee": set(),
         "breezy": set(), "gem": set(), "teamtailor": set(), "icims": set(), "oracle": set(),
-        "successfactors": set(), "phenom": set(), "rippling": set()}
+        "successfactors": set(), "phenom": set(), "rippling": set(), "jibe": set()}
+# Companies found by hand (not on any list yet): board -> company name
+SEED_BOARDS = {("greenhouse", "riotgames"): "Riot Games", ("workday", ("mitre", "wd5", "MITRE")): "MITRE",
+               ("phenom", ("careers.synovus.com", "us/en")): "Synovus", ("oracle", ("eluq.fa.us2.oraclecloud.com", "CX_2001")): "Kroger",
+               ("jibe", "careers.amd.com"): "AMD", ("jibe", "jobs.statefarm.com"): "State Farm",
+               ("jibe", "careers.jhuapl.edu"): "Johns Hopkins APL", ("jibe", "careers.chick-fil-a.com"): "Chick-fil-A"}
+for (k, b), n in SEED_BOARDS.items():
+    SEED[k].add(b)
 
 INTERN = re.compile(r"\bintern(ship)?s?\b|\bco-?op\b", re.I)
 # Strictly software engineering: AI/ML/data roles only count if the title also says software/SWE/developer.
@@ -197,6 +204,9 @@ def fetch_lists():
             boards[key[0]].add(key[1])
             names[key] = j["company"]
             hot.add(key)  # companies on intern lists get checked every cycle
+    for key, n in SEED_BOARDS.items():
+        names.setdefault(key, n)
+        hot.add(key)
     if DISCOVERED.exists():
         for k, bs in json.loads(DISCOVERED.read_text()).items():
             boards.setdefault(k, set()).update(tuple(b) if isinstance(b, list) else b for b in bs)
@@ -314,7 +324,8 @@ def icims(sub):
     """iCIMS has no JSON API; read its (stable) search-results HTML. No dates: fetch() times new ones on sight."""
     page = ""
     for q in ("intern", "co-op"):
-        req = urllib.request.Request(f"https://{sub}.icims.com/jobs/search?ss=1&searchKeyword={q}&in_iframe=1",
+        host = sub if "." in sub else f"{sub}.icims.com"  # iCIMS on the company's own domain (careers.amd.com) or *.icims.com
+        req = urllib.request.Request(f"https://{host}/jobs/search?ss=1&searchKeyword={q}&in_iframe=1",
                                      headers={"User-Agent": "Mozilla/5.0 internboard"})
         with urllib.request.urlopen(req, timeout=20) as r:
             page += r.read().decode("utf-8", "replace")
@@ -327,7 +338,7 @@ def icims(sub):
         seen_links.add(link.group(1))
         loc = re.search(r"Job Locations</span>\s*<span[^>]*>(.*?)</span>", card, re.S)
         desc = re.search(r'class="col-xs-12 description">(.*?)</div>', card, re.S)
-        out.append(tag(job(sub.removeprefix("careers-"), html.unescape(title.group(1)).strip(),
+        out.append(tag(job(sub.split(".")[1] if "." in sub else sub.removeprefix("careers-"), html.unescape(title.group(1)).strip(),
                            html.unescape(loc.group(1)).strip() if loc else "", link.group(1), 0, "iCIMS", True),
                        desc=desc.group(1) if desc else ""))
     return out
@@ -368,6 +379,21 @@ def phenom(b):
             out[url] = tag(job(host, p["title"], p.get("location") or p.get("cityStateCountry"), url,
                                iso(p["postedDate"]) if p.get("postedDate") else 0, "Phenom", True),
                            desc=" ".join(texts([p.get("descriptionTeaser"), p.get("ml_skills")])))
+    return list(out.values())
+
+
+def jibe(host):
+    """iCIMS/Jibe career sites on a company's own domain (careers.amd.com, jobs.statefarm.com, careers.jhuapl.edu):
+    JSON API, newest first, exact posting times and full descriptions."""
+    out = {}
+    for q in ("intern", "co-op"):
+        d = http(f"https://{host}/api/jobs?keywords={q}&page=1&limit=100&sortBy=posted_date&descending=true")
+        for p in (x["data"] for x in d.get("jobs", [])):
+            url = f"https://{host}/jobs/{p.get('slug') or p['req_id']}"
+            out[url] = tag(job(p.get("hiring_organization") or host.split(".")[1], p["title"],
+                               p.get("full_location") or p.get("location_name"), url,
+                               iso(p["posted_date"].replace("+0000", "+00:00")) if p.get("posted_date") else 0, "iCIMS"),
+                           desc=" ".join(filter(None, [p.get("description"), p.get("qualifications"), p.get("responsibilities")])))
     return list(out.values())
 
 
@@ -414,7 +440,7 @@ def google(_):
 
 FETCHERS = {"greenhouse": greenhouse, "lever": lever, "ashby": ashby, "smartrecruiters": smartrecruiters,
             "workday": workday, "workable": workable, "recruitee": recruitee, "breezy": breezy, "gem": gem, "teamtailor": teamtailor, "oracle": oracle, "icims": icims, "amazon": amazon,
-            "successfactors": successfactors, "phenom": phenom, "rippling": rippling, "tiktok": tiktok, "google": google}
+            "successfactors": successfactors, "phenom": phenom, "jibe": jibe, "rippling": rippling, "tiktok": tiktok, "google": google}
 WORKDAY_WORKERS = 4  # Workday returns 429 above a few concurrent requests; raise carefully
 
 
@@ -924,7 +950,7 @@ if __name__ == "__main__":
         ok = ntfy(f"{j['company']}: {j['title']}", f"{j['location'] or 'Location not listed'}\nvia {j['source']} · test alert",
                   click=j["url"], tags=["white_check_mark"], priority=4)
         sys.exit(print(f"sent: {j['company']}: {j['title']} -> {j['url']}" if ok else "not sent (is NTFY_TOPIC set in .env?)"))
-    threading.Thread(target=run_loop, args=("fast", ["greenhouse", "lever", "ashby", "smartrecruiters", "recruitee", "breezy", "gem", "teamtailor", "oracle", "icims", "amazon", "successfactors", "phenom", "rippling", "tiktok", "google"], 64), daemon=True).start()
+    threading.Thread(target=run_loop, args=("fast", ["greenhouse", "lever", "ashby", "smartrecruiters", "recruitee", "breezy", "gem", "teamtailor", "oracle", "icims", "amazon", "successfactors", "phenom", "jibe", "rippling", "tiktok", "google"], 64), daemon=True).start()
     threading.Thread(target=run_loop, args=("workable", ["workable"], 2), daemon=True).start()  # Cloudflare 1015s above that
     threading.Thread(target=verify_loop, daemon=True).start()
     threading.Thread(target=signals_loop, daemon=True).start()
