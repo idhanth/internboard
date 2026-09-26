@@ -1,0 +1,30 @@
+# Outside watchdog: runs on GitHub's servers (not ours), so it still alerts if the whole server dies.
+# Every 30 min (keeps a private repo inside GitHub's free 2,000 Actions minutes/month).
+name: monitor
+on:
+  schedule: [{cron: "*/30 * * * *"}]
+  workflow_dispatch: {}
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Check the board is up and still updating
+        env:
+          SITE_URL: ${{ secrets.SITE_URL }}
+          SITE_PASS: ${{ secrets.SITE_PASS }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          alert() {
+            curl -s -o /dev/null -H "Title: ⚠️ Intern board: $1" -H "Priority: high" -H "Tags: warning" \
+              -H "Click: $SITE_URL" -d "$2" "https://ntfy.sh/$NTFY_TOPIC"
+            echo "::error::$1 — $2"; exit 1
+          }
+          body=$(curl -s -m 30 -u "me:$SITE_PASS" -w '\n%{http_code}' "$SITE_URL/api/jobs?v=0") || alert "DOWN" "Couldn't reach the site at all."
+          code=$(tail -n1 <<<"$body"); json=$(sed '$d' <<<"$body")
+          [ "$code" = 200 ] || alert "DOWN" "Site answered HTTP $code."
+          polled=$(jq -r .polled <<<"$json"); age=$(( $(date +%s) - polled ))
+          [ "$age" -lt 1200 ] || alert "STALLED" "Last update was $((age / 60)) min ago (expected every ~1-2 min)."
+          n=$(jq '.jobs | length' <<<"$json")
+          [ "$n" -gt 200 ] || alert "EMPTY" "Only $n internships listed; sources may be failing."
+          echo "OK: updated ${age}s ago, $n internships"

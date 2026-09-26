@@ -84,3 +84,25 @@ assert len(sent) == 1, sent  # once only
 (title, message), kw = sent[0]
 assert title == "Acme: Software Engineer Intern" and message.startswith("Atlanta, GA") and "Greenhouse" in message and kw["click"] == "https://x/apply", sent
 print("ok")
+
+# politeness: a 429 pauses the platform (honouring Retry-After) and later boards are skipped; a 403 blocks the board
+import urllib.error, email.message
+def raise_code(code, retry=None):
+    def f(b):
+        hdrs = email.message.Message()
+        if retry: hdrs["Retry-After"] = retry
+        raise urllib.error.HTTPError("u", code, "x", hdrs, None)
+    return f
+board.FETCHERS["lever"] = raise_code(429, "120")
+board.fetch(("lever", "a"))
+assert board.cooldown["lever"] > _t.time() + 100 and board.backoff["lever"] == 120
+calls = []
+board.FETCHERS["lever"] = lambda b: calls.append(b) or []
+board.fetch(("lever", "b"))
+assert not calls, "paused platform must not be called"
+board.FETCHERS["ashby"] = raise_code(403)
+board.fetch(("ashby", "x"))
+assert ("ashby", "x") in board.dead and board.errlog["ashby"][-1][1] == "403"
+r = board.health_report()
+assert r["lever"]["rate_limited_1h"] == 1 and r["ashby"]["blocked_1h"] == 1 and r["lever"]["paused_until"] > 0
+print("ok")

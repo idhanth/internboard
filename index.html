@@ -153,7 +153,7 @@ nav button[aria-pressed=true]{background:var(--card);color:var(--fg);box-shadow:
 
 <section id="health" hidden>
   <p class="mut" id="healthSum"></p>
-  <table class="htable"><thead><tr><th>Source</th><th>Known boards</th><th>Checked</th><th>Healthy</th><th>Failing</th><th>Closed (skipped 24h)</th><th>Listings</th><th>Median response</th><th>Last success</th></tr></thead><tbody id="healthRows"></tbody></table>
+  <table class="htable"><thead><tr><th>Source</th><th>Known boards</th><th>Checked</th><th>Healthy</th><th>Failing</th><th>Closed (skipped 24h)</th><th>Listings</th><th>Median response</th><th>Last success</th><th>429s (1h)</th><th>403 blocks (1h)</th><th>Other errors (1h)</th><th>Status</th></tr></thead><tbody id="healthRows"></tbody></table>
   <h3 style="margin-top:24px">Failing examples</h3><div id="healthFails" class="mut"></div>
 </section>
 
@@ -472,7 +472,9 @@ async function loadHealth() {
   $('healthSum').innerHTML = `<b class="${tot.h / tot.c > .8 ? 'good' : 'bad'}">${tot.h.toLocaleString()} / ${tot.c.toLocaleString()}</b> checked sources healthy · closed boards are skipped for a day, and boards not yet checked are the long tail waiting their turn`;
   $('healthRows').innerHTML = rows.map(([k, r]) => `<tr><td><b>${k}</b></td><td>${r.known.toLocaleString()}</td><td>${r.checked.toLocaleString()}</td>
     <td class="good">${r.healthy.toLocaleString()}</td><td class="${r.failing ? 'bad' : ''}">${r.failing.toLocaleString()}</td><td>${r.dead.toLocaleString()}</td>
-    <td>${r.listings.toLocaleString()}</td><td>${r.median_ms ?? '–'} ms</td><td>${r.last_ok ? ago(r.last_ok) : '–'}</td></tr>`).join('');
+    <td>${r.listings.toLocaleString()}</td><td>${r.median_ms ?? '–'} ms</td><td>${r.last_ok ? ago(r.last_ok) : '–'}</td>
+    <td class="${r.rate_limited_1h ? 'bad' : ''}">${r.rate_limited_1h}</td><td class="${r.blocked_1h ? 'bad' : ''}">${r.blocked_1h}</td><td>${r.errors_1h}</td>
+    <td>${r.paused_until ? `<span class="bad">paused ${Math.ceil((r.paused_until - Date.now() / 1000) / 60)} min (rate limit)</span>` : '<span class="good">ok</span>'}</td></tr>`).join('');
   $('healthFails').innerHTML = rows.filter(([, r]) => r.failing).map(([k, r]) => `<p><b>${k}</b>: ${Object.entries(r.errors).map(([e, n]) => `${n}× ${esc(e)}`).join(', ')}<br>
     ${r.examples.map(x => `${esc(x.board)} (${esc(x.why)}, last OK ${x.last_ok ? ago(x.last_ok) : 'never'})`).join(' · ')}</p>`).join('') || 'None 🎉';
 }

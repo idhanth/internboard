@@ -421,7 +421,7 @@ def google(_):
     """Google's careers results page, newest intern roles. ponytail: parses Google's HTML (class names can change);
     the Health tab will show it failing if they do."""
     req = urllib.request.Request("https://www.google.com/about/careers/applications/jobs/results?q=software&"
-                                 "target_level=INTERN_AND_APPRENTICE&sort_by=date", headers={"User-Agent": "Mozilla/5.0"})
+                                 "target_level=INTERN_AND_APPRENTICE&sort_by=date", headers={"User-Agent": "Mozilla/5.0 internboard"})
     with urllib.request.urlopen(req, timeout=20) as r:
         page = r.read().decode("utf-8", "replace")
     out = []
@@ -458,40 +458,66 @@ def sharpen(key, res):
     return res
 
 
+# Politeness: a 429 pauses the whole platform (Retry-After if given, else 30s doubling to 10 min); successes ease it
+# back. A 403 is a deliberate block: that board is skipped for a day and never worked around.
+cooldown, backoff = {}, {}  # kind -> paused-until ts, kind -> current backoff seconds
+errlog = {}  # kind -> [(ts, "429" | "403" | "404" | "5xx" | "other")], pruned to the last hour
+
+
+def note_error(kind, code):
+    now = time.time()
+    log = errlog.setdefault(kind, [])
+    log.append((now, code))
+    while log and log[0][0] < now - 3600:
+        log.pop(0)
+
+
 def fetch(key):
     kind, b = key
     h = health.setdefault(key, {})
-    for attempt in range(3):
-        t = time.time()
-        try:
-            res = FETCHERS[kind](b)
-            baseline = key not in cache  # first check of this board: its jobs aren't "new", just newly known
-            now = int(time.time())
-            for j in res:
-                if j["url"] not in detected and INTERN.search(j["title"]):  # only internships matter
-                    # first check of a board: its jobs aren't new. Dated ones keep their date; undated ones get 0
-                    # ("date unknown") so they never look fresh or trigger alerts/batches.
-                    detected[j["url"]] = j["posted"] if baseline else now
-            if kind in COMPLETE and key in cache:  # jobs that vanished from a complete feed have closed
-                gone = {j["url"] for j in cache[key]} - {j["url"] for j in res}
-                for j in cache[key]:
-                    if j["url"] in gone and j["url"] in shown_urls:
-                        closed[j["url"]] = {**shown_urls[j["url"]], "closed": now}
-            for j in res:
-                closed.pop(j["url"], None)  # reposted / reopened
-            cache[key] = sharpen(key, res)
-            h.update(ok=int(t), ms=int(1000 * (time.time() - t)), n=len(res))
-            return
-        except urllib.error.HTTPError as e:
-            h.update(err=int(t), why=f"HTTP {e.code}")
-            if e.code in (404, 410):
-                dead[key] = time.time()  # renamed/closed board
-            if e.code != 429:
-                return
-            time.sleep(5 * (attempt + 1))
-        except Exception as e:
-            h.update(err=int(t), why=type(e).__name__)
-            return
+    if time.time() < cooldown.get(kind, 0):
+        return  # platform is rate-limiting us: skip until the pause ends
+    t = time.time()
+    try:
+        res = FETCHERS[kind](b)
+        baseline = key not in cache  # first check of this board: its jobs aren't "new", just newly known
+        now = int(time.time())
+        for j in res:
+            if j["url"] not in detected and INTERN.search(j["title"]):  # only internships matter
+                # first check of a board: its jobs aren't new. Dated ones keep their date; undated ones get 0
+                # ("date unknown") so they never look fresh or trigger alerts/batches.
+                detected[j["url"]] = j["posted"] if baseline else now
+        if kind in COMPLETE and key in cache:  # jobs that vanished from a complete feed have closed
+            gone = {j["url"] for j in cache[key]} - {j["url"] for j in res}
+            for j in cache[key]:
+                if j["url"] in gone and j["url"] in shown_urls:
+                    closed[j["url"]] = {**shown_urls[j["url"]], "closed": now}
+        for j in res:
+            closed.pop(j["url"], None)  # reposted / reopened
+        cache[key] = sharpen(key, res)
+        h.update(ok=int(t), ms=int(1000 * (time.time() - t)), n=len(res))
+        backoff[kind] = backoff.get(kind, 0) // 2  # ease back after successes
+        return
+    except urllib.error.HTTPError as e:
+        h.update(err=int(t), why=f"HTTP {e.code}")
+        if e.code == 429:
+            note_error(kind, "429")
+            retry_after = e.headers.get("Retry-After", "")
+            backoff[kind] = int(retry_after) if retry_after.isdigit() else min(600, max(30, backoff.get(kind, 0) * 2))
+            cooldown[kind] = time.time() + backoff[kind]
+        elif e.code == 403:
+            note_error(kind, "403")
+            dead[key] = time.time()  # blocked: respect it, skip this board for DEAD_FOR
+        elif e.code in (404, 410):
+            note_error(kind, "404")
+            dead[key] = time.time()  # renamed/closed board
+        else:
+            note_error(kind, "5xx" if e.code >= 500 else "other")
+        return
+    except Exception as e:
+        h.update(err=int(t), why=type(e).__name__)
+        note_error(kind, "other")
+        return
 
 
 def health_report():
@@ -514,9 +540,12 @@ def health_report():
             if len(r["examples"]) < 8:
                 r["examples"].append({"board": " / ".join(b) if isinstance(b, tuple) else b, "why": h["why"],
                                       "since": h["err"], "last_ok": h.get("ok", 0)})
-    for r in out.values():
+    for kind, r in out.items():
         ms = sorted(r.pop("ms"))
         r["median_ms"] = ms[len(ms) // 2] if ms else None
+        recent = [c for t, c in errlog.get(kind, []) if t > now - 3600]
+        r.update(rate_limited_1h=recent.count("429"), blocked_1h=recent.count("403"),
+                 errors_1h=sum(c in ("5xx", "other") for c in recent), paused_until=int(cooldown.get(kind, 0)) if cooldown.get(kind, 0) > now else 0)
     return out
 
 
