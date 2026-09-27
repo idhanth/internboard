@@ -1256,6 +1256,7 @@ def coverage_report():
     return {"verified_companies_monitored_directly": len(verified),
             "verified_confirmed_paid": len({canon(k) for k in verified_boards if working(k) and k in paid_boards}),
             "verified_pay_unknown": len(verified) - len({canon(k) for k in verified_boards if working(k) and k in paid_boards}),
+            "verified_confirmed_unpaid": len({canon(k) for k in verified_boards if working(k) and k in unpaid_only}),
             "active_boards": known - inactive, "inactive_boards": inactive,
             "checked_at_least_once_pct": round(100 * checked / max(1, known), 1), "boards_checked": checked,
             "verified_by_platform": {k: len(v) for k, v in sorted(by_kind.items(), key=lambda x: -len(x[1]))},

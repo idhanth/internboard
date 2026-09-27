@@ -484,7 +484,7 @@ async function loadHealth() {
     const C = (await (await fetch('/api/stats')).json()).coverage;
     $('coverage').innerHTML = `<div class="kpis">
       <div class="kpi main"><b>${C.verified_companies_monitored_directly.toLocaleString()}</b><span>verified SWE companies monitored directly</span>
-        <small>${C.verified_confirmed_paid} confirmed paid · ${C.verified_pay_unknown} pay unknown</small></div>
+        <small>${C.verified_confirmed_paid} confirmed paid · ${C.verified_pay_unknown} pay unknown (still counted) · ${C.verified_confirmed_unpaid ?? 0} confirmed unpaid (not counted)</small></div>
       <div class="kpi"><b>${C.companies_with_any_internship_history.toLocaleString()}</b><span>companies with any internship history</span></div>
       <div class="kpi"><b>${C.active_boards.toLocaleString()}</b><span>active boards</span><small>${C.inactive_boards.toLocaleString()} inactive / dead</small></div>
       <div class="kpi"><b>${C.checked_at_least_once_pct}%</b><span>of boards checked at least once</span><small>${C.boards_checked.toLocaleString()} of ${C.raw_discovered_boards.toLocaleString()} raw discovered</small></div>
