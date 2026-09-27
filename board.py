@@ -577,6 +577,8 @@ def fetch(key):
                      unchanged=h.get("unchanged", 0) + 1, fails=0)
             return
         h["digest"] = digest
+        if res:
+            intern_boards.add(key)
         baseline = key not in cache  # first check of this board: its jobs aren't "new", just newly known
         now = int(time.time())
         for j in res:
@@ -653,14 +655,16 @@ def health_report():
 # Every board has its own next-check time; nothing is checked "all at once". Tiers:
 #   T1  companies that have posted SWE internships (on the board now or before, seeds, watched): every TIER_S[1]
 #   T2  companies that post internships of any kind (on the intern lists, or intern roles seen): every TIER_S[2]
-#   T3  the long tail found by crawling: every TIER_S[3]
+#   T3  boards that have had internship postings before, or not checked yet: every TIER_S[3]
+#   T4  checked, and have never shown a single internship posting: every TIER_S[4] (hourly)
 # New boards get a random first slot inside their interval, and every check reschedules with +/-10% jitter, so load
 # spreads evenly across time. Per-platform caps keep throttling platforms (Workday, Workable) polite.
-TIER_S = {1: 60, 2: 240, 3: 900}
+TIER_S = {1: 60, 2: 240, 3: 900, 4: 3600}
 WORKERS = 40  # measured: 24 workers -> 2,050 checks/min at 33% CPU (network-bound); see /api/stats "scheduler"
 PLATFORM_CAP = {"workday": 4, "workable": 2, "recruitee": 2}  # concurrent requests per platform
 INACTIVE_AFTER, INACTIVE_RETRY = 3, 7 * 86400  # 3 failures in a row -> checked weekly instead
 swe_boards = set()  # boards that have ever had a SWE/hidden-SWE internship on the board (-> tier 1)
+intern_boards = set()  # boards that have ever had any internship posting (-> never tier 4)
 next_due, inflight = {}, set()
 sched_lock = threading.Lock()
 
@@ -670,7 +674,9 @@ def tier(key):
         return 1
     if key in hot or (key in cache and cache[key]):
         return 2
-    return 3
+    if key in intern_boards or "ok" not in health.get(key, {}):
+        return 3
+    return 4
 
 
 def interval(key):
@@ -727,6 +733,9 @@ def scheduler():
                 tl_[1] += now - t
                 pool.submit(run_board, key)
             SCHED["overdue"] = len(due_keys)
+            SCHED["overdue_by_tier"] = {}
+            for _, key in due_keys:
+                SCHED["overdue_by_tier"][tier(key)] = SCHED["overdue_by_tier"].get(tier(key), 0) + 1
         time.sleep(0.5)
 
 
@@ -734,6 +743,7 @@ SCHED = {"started": 0, "lag_total": 0.0, "overdue": 0, "by_tier": {}}
 if SOURCES.exists():  # restore SWE history (tier 1) and failure counts from the last run
     _reg = json.loads(SOURCES.read_text())
     swe_boards.update(_as_key(k, b) for k, b in _reg.get("swe_boards", []))
+    intern_boards.update(_as_key(k, b) for k, b in _reg.get("intern_boards", []))
     for k, b, n in _reg.get("fails", []):
         health.setdefault(_as_key(k, b), {})["fails"] = n
 
@@ -953,7 +963,7 @@ def _rebuild():
         save(VERDICTS, verdicts)
         save(DETECTED, {u: t for u, t in list(detected.items()) if t > cutoff or u in live})
         save(CLOSED, closed)
-        save(SOURCES, {"swe_boards": [[k, b] for k, b in swe_boards],
+        save(SOURCES, {"swe_boards": [[k, b] for k, b in swe_boards], "intern_boards": [[k, b] for k, b in intern_boards],
                        "fails": [[k, b, h["fails"]] for (k, b), h in list(health.items()) if h.get("fails")]})
 
 
@@ -1166,6 +1176,7 @@ def sched_report():
         tiers[t] = tiers.get(t, 0) + 1
     up = max(1, now - STATS["since"])
     return {"workers": WORKERS, "inflight": len(inflight), "overdue_now": SCHED["overdue"],
+            "overdue_by_tier": SCHED.get("overdue_by_tier", {}),
             "avg_start_lag_s": round(SCHED["lag_total"] / max(1, SCHED["started"]), 1),
             "checks_per_min": round(SCHED["started"] / up * 60, 1),
             "avg_start_lag_by_tier_s": {t: round(v[1] / max(1, v[0]), 1) for t, v in SCHED["by_tier"].items()},

@@ -112,3 +112,9 @@ board.swe_boards.add(("greenhouse", "acme")); assert board.tier(("greenhouse", "
 assert board.tier(("greenhouse", "never-seen-co")) == 3
 board.health[("greenhouse", "gone")] = {"fails": 3}; assert board.interval(("greenhouse", "gone")) == board.INACTIVE_RETRY
 print("ok")
+
+# tier 4: checked and never had an internship -> hourly; unchecked boards stay tier 3 until their first result
+board.health[("breezy", "no-interns")] = {"ok": 1}; assert board.tier(("breezy", "no-interns")) == 4
+assert board.tier(("breezy", "unchecked-yet")) == 3
+board.intern_boards.add(("breezy", "had-one")); board.health[("breezy", "had-one")] = {"ok": 1}; assert board.tier(("breezy", "had-one")) == 3
+print("ok")
