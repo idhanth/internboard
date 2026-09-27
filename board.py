@@ -765,6 +765,9 @@ if SOURCES.exists():  # restore SWE history (tier 1) and failure counts from the
     verified_boards.update(_as_key(k, b) for k, b in _reg.get("verified_boards", []))
     for k, b, n in _reg.get("fails", []):
         health.setdefault(_as_key(k, b), {})["fails"] = n
+    for k, b, ok, err, st, n in _reg.get("health", []):
+        h = health.setdefault(_as_key(k, b), {})
+        h.update({f: v for f, v in (("ok", ok), ("err", err)) if v}, status=st, n=n)
 
 
 def is_swe(j):
@@ -1007,7 +1010,10 @@ def _rebuild():
         save(CLOSED, closed)
         save(SOURCES, {"swe_boards": [[k, b] for k, b in swe_boards], "intern_boards": [[k, b] for k, b in intern_boards],
                        "verified_boards": [[k, b] for k, b in verified_boards],
-                       "fails": [[k, b, h["fails"]] for (k, b), h in list(health.items()) if h.get("fails")]})
+                       "fails": [[k, b, h["fails"]] for (k, b), h in list(health.items()) if h.get("fails")],
+                       # last successful check / last error / status / job count per board, so KPIs survive restarts
+                       "health": [[k, b, h.get("ok", 0), h.get("err", 0), h.get("status", ""), h.get("n", 0)]
+                                  for (k, b), h in list(health.items()) if "ok" in h or "err" in h]})
 
 
 LISTS_EVERY = 600  # aggregator lists (Simplify, SpeedyApply, vanshb03, GitHub submissions) are fallback coverage
@@ -1256,7 +1262,9 @@ def coverage_report():
             "companies_with_any_internship_history": len({canon(k) for k in intern_boards}),
             "raw_discovered_boards": sum(len(v) for v in boards.values()),
             "definition": "company whose own job board we poll successfully and that has had a US (or unspecified), "
-                          "non-grad-only internship passing the SWE filter; paid assumed unless the posting says unpaid"}
+                          "non-grad-only SWE-type internship (software, backend/frontend/mobile, platform/infra, DevOps/SRE, "
+                          "data/ML/AI engineering, firmware/embedded, security engineering: judged on title and description); "
+                          "companies whose only such roles are marked unpaid are excluded; pay is shown as confirmed or unknown"}
 
 
 def stats_report():

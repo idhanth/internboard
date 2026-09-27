@@ -149,3 +149,11 @@ print("ok")
 
 assert is_swe({"title": "AI Developer Intern"})  # a developer role building AI software is in scope
 print("ok")
+
+# registry persistence: board health (last ok / status / jobs) survives a restart
+import importlib, json as _j
+board.health[("lever", "persist-me")] = {"ok": 123, "status": "ok", "n": 7}
+board._last_save[0] = 0; board.SOURCES = tmp / "sources.json"; board._rebuild()
+reg = _j.loads((tmp / "sources.json").read_text())
+assert ["lever", "persist-me", 123, 0, "ok", 7] in reg["health"], reg["health"][:3]
+print("ok")
