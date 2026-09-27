@@ -7,10 +7,10 @@ Sources:
   - Every Greenhouse / Lever / Ashby / SmartRecruiters / Workable / Recruitee / Breezy / Gem / Teamtailor / Workday
     board above, polled directly,
     plus Amazon's jobs API.
-Hot boards (companies that list SWE interns) are checked every cycle (~40s; Workday ~6 min, it rate-limits);
-the long tail is checked every COLD_EVERY cycles.
+Each board is checked on its own schedule by tier (see scheduler()): companies with SWE-internship history every
+minute, other intern-posting companies every 4 min, the long tail every 15 min. Aggregator lists every 10 min.
 """
-import calendar, html, json, os, re, sys, threading, time, urllib.error, urllib.request, zlib
+import calendar, functools, gzip, html, json, os, random, re, sys, threading, time, urllib.error, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -34,17 +34,56 @@ SITE_URL = os.environ.get("SITE_URL", "http://localhost:8000")
 def save(path, obj, **kw):
     """Write JSON atomically (temp file + rename) so a reader or a crash never sees half a file."""
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(obj, **kw))
+    data = json.dumps(obj, **kw)
+    tmp.write_text(data)
     os.replace(tmp, path)
+    STATS["disk_bytes_written"] += len(data)
+    STATS["disk_writes"] += 1
+
+
+# ---------------------------------------------------------------- measurement (/api/stats)
+# Every HTTP request is counted per platform via a thin wrapper around urlopen; the calling thread says which
+# platform it's working for (tl.kind). Plus rebuild timings/overlap and disk writes. Counters reset on restart.
+STATS = {"since": time.time(), "http": {}, "disk_bytes_written": 0, "disk_writes": 0, "rebuilds": 0, "rebuild_seconds": 0.0,
+         "rebuild_jobs_scanned": 0, "rebuild_overlaps": 0, "rebuilds_running": 0, "loops": {}}
+tl = threading.local()
+_urlopen = urllib.request.urlopen
+
+
+def _counting_urlopen(req, *a, **k):
+    """Counts requests/bytes per platform, and asks for gzip (job feeds are text: ~5-8x smaller on the wire)."""
+    st = STATS["http"].setdefault(getattr(tl, "kind", "other"), {"requests": 0, "bytes": 0, "errors": 0, "not_modified": 0})
+    st["requests"] += 1
+    if isinstance(req, str):
+        req = urllib.request.Request(req)
+    if not req.has_header("Accept-encoding"):
+        req.add_header("Accept-Encoding", "gzip")
+    try:
+        resp = _urlopen(req, *a, **k)
+    except urllib.error.HTTPError as e:
+        st["not_modified" if e.code == 304 else "errors"] += 1
+        raise
+    except Exception:
+        st["errors"] += 1
+        raise
+    read, zipped = resp.read, resp.headers.get("Content-Encoding", "") == "gzip"
+
+    def counted(*ra, **rk):
+        data = read()
+        st["bytes"] += len(data)
+        return gzip.decompress(data) if zipped else data
+    resp.read = counted
+    return resp
+
+
+urllib.request.urlopen = _counting_urlopen
 TRACKER = HERE / "tracker.json"
 SEEN = HERE / "seen.json"  # first time we saw jobs whose source has no exact post time (Workday)
-MIN_CYCLE = 30  # seconds between sweep starts
 LISTS = ["https://raw.githubusercontent.com/SimplifyJobs/Summer2027-Internships/dev/.github/scripts/listings.json",
          "https://raw.githubusercontent.com/SimplifyJobs/New-Grad-Positions/dev/.github/scripts/listings.json",
          "https://raw.githubusercontent.com/vanshb03/Summer2027-Internships/dev/.github/scripts/listings.json"]
 SPEEDYAPPLY = ["https://raw.githubusercontent.com/speedyapply/2027-SWE-College-Jobs/main/README.md",
                "https://raw.githubusercontent.com/speedyapply/2027-SWE-College-Jobs/main/INTERN_INTL.md"]
-COLD_EVERY = 10  # long-tail boards are checked every 10th cycle (~7 min fast loop, ~1 h Workday)
 DEAD_FOR = 86400  # a board that 404s is skipped for a day
 # Seeds so big names are covered even if they drop out of the lists.
 SEED = {"greenhouse": {"stripe", "airbnb", "databricks", "robinhood", "figma", "discord", "coinbase", "cloudflare",
@@ -124,16 +163,36 @@ submissions = []  # "New Internship" GitHub issues: real postings, often before 
 intern_activity = {}  # company (lower) -> non-SWE internship roles it detected in the last 30 days
 VERDICTS = HERE / "verdicts2.json"  # hidden-SWE job url -> {"s": 0-100 score, "why": [matched skills]} (checked once)
 verdicts = json.loads(VERDICTS.read_text()) if VERDICTS.exists() else {}
-hot, dead, cycles = set(), {}, {"fast": 0, "workday": 0, "workable": 0}
+hot, dead = set(), {}
+SOURCES = HERE / "sources.json"  # registry state that must survive restarts: SWE history (tier 1) and failure counts
+_as_key = lambda k, b: (k, tuple(b) if isinstance(b, list) else b)
 shown_urls = {}  # url -> job currently on the board (for closed-job detection)  # boards with SWE intern roles; 404'd boards -> when
 tracker_lock = threading.Lock()
 
 
-def http(url, body=None, headers=None):
-    req = urllib.request.Request(url, json.dumps(body).encode() if body else None,
-                                 {"User-Agent": "Mozilla/5.0 internboard", "Content-Type": "application/json", **(headers or {})})
-    with urllib.request.urlopen(req, timeout=20) as r:
-        return json.load(r)
+class NotModified(Exception):
+    """The source answered 304: nothing changed since our last look, so there's nothing to download or process."""
+
+
+etags = {}  # url -> ETag from the last full response
+
+
+def http(url, body=None, headers=None, etag=False):
+    """GET/POST JSON. etag=True sends If-None-Match and raises NotModified on 304. Only for single-request
+    fetchers, where "this URL is unchanged" means "this board is unchanged"."""
+    hdrs = {"User-Agent": "Mozilla/5.0 internboard", "Content-Type": "application/json", **(headers or {})}
+    if etag and url in etags:
+        hdrs["If-None-Match"] = etags[url]
+    req = urllib.request.Request(url, json.dumps(body).encode() if body else None, hdrs)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            if etag and r.headers.get("ETag"):
+                etags[url] = r.headers["ETag"]
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        if e.code == 304:
+            raise NotModified() from None
+        raise
 
 
 def iso(s):
@@ -177,13 +236,20 @@ def speedyapply(url):
     return out
 
 
+list_cache = {}  # list url -> last parsed rows (reused on 304)
+
+
 def fetch_lists():
     out, boards, every = [], {k: set(v) for k, v in SEED.items()}, []
     for u in LISTS:
+        try:
+            rows = list_cache[u] = http(u, etag=True)
+        except NotModified:
+            rows = list_cache[u]
         every += [tag(job(j["company_name"], j["title"], ", ".join(j.get("locations", [])), j["url"], j["date_posted"], "Simplify")
                       | {"terms": ", ".join(j.get("terms") or ([j["season"]] if j.get("season") else []))},
                       desc={"s": 80, "why": ["Simplify: Software"]} if "Software" in (j.get("category") or "") else "")
-                  | {"live": j.get("active") and j.get("is_visible", True)} for j in http(u)]
+                  | {"live": j.get("active") and j.get("is_visible", True)} for j in rows]
     out = [j for j in every if j.pop("live")]
     live_urls = {j["url"] for j in out}
     for j in every:  # a list marking a role inactive = closed
@@ -203,7 +269,9 @@ def fetch_lists():
         if key := board_of(j["url"]):
             boards[key[0]].add(key[1])
             names[key] = j["company"]
-            hot.add(key)  # companies on intern lists get checked every cycle
+            hot.add(key)  # companies on intern lists: tier 2 at least
+            if is_swe(j):
+                swe_boards.add(key)  # has posted SWE internships: tier 1
     for key, n in SEED_BOARDS.items():
         names.setdefault(key, n)
         hot.add(key)
@@ -217,19 +285,19 @@ def greenhouse(s):
     return [tag(job(s, j["title"], j["location"]["name"], j["absolute_url"],
                     iso(j.get("first_published") or j["updated_at"]), "Greenhouse"),
                 detail=f"https://boards-api.greenhouse.io/v1/boards/{s}/jobs/{j['id']}")
-            for j in http(f"https://boards-api.greenhouse.io/v1/boards/{s}/jobs")["jobs"]]
+            for j in http(f"https://boards-api.greenhouse.io/v1/boards/{s}/jobs", etag=True)["jobs"]]
 
 
 def lever(s):
     return [tag(job(s, j["text"], j["categories"].get("location"), j["hostedUrl"], j["createdAt"] / 1000, "Lever"),
                 desc=" ".join(texts([j.get("descriptionPlain"), j.get("lists")])))
-            for j in http(f"https://api.lever.co/v0/postings/{s}?mode=json")]
+            for j in http(f"https://api.lever.co/v0/postings/{s}?mode=json", etag=True)]
 
 
 def ashby(s):
     return [tag(job(s, j["title"], j.get("location"), j["jobUrl"], iso(j["publishedAt"]), "Ashby"),
                 desc=j.get("descriptionPlain") or "")
-            for j in http(f"https://api.ashbyhq.com/posting-api/job-board/{s}")["jobs"]]
+            for j in http(f"https://api.ashbyhq.com/posting-api/job-board/{s}", etag=True)["jobs"]]
 
 
 def smartrecruiters(s):
@@ -248,7 +316,7 @@ def workday(b):
     # one page of the best matches per search; companies known to hire interns also get a "technology intern"
     # search for tech programs. ponytail: a company with >20 matches per search loses the tail
     posts = {}
-    for q in ["software intern"] + (["technology intern", "software co-op"] if ("workday", b) in hot else []):
+    for q in ["software intern"] + (["technology intern", "software co-op"] if tier(("workday", b)) == 1 else []):
         for p in http(f"{base}/wday/cxs/{tenant}/{site}/jobs",
                       {"appliedFacets": {}, "limit": 20, "offset": 0, "searchText": q}).get("jobPostings", []):
             posts[p["externalPath"]] = p
@@ -441,7 +509,6 @@ def google(_):
 FETCHERS = {"greenhouse": greenhouse, "lever": lever, "ashby": ashby, "smartrecruiters": smartrecruiters,
             "workday": workday, "workable": workable, "recruitee": recruitee, "breezy": breezy, "gem": gem, "teamtailor": teamtailor, "oracle": oracle, "icims": icims, "amazon": amazon,
             "successfactors": successfactors, "phenom": phenom, "jibe": jibe, "rippling": rippling, "tiktok": tiktok, "google": google}
-WORKDAY_WORKERS = 4  # Workday returns 429 above a few concurrent requests; raise carefully
 
 
 def sharpen(key, res):
@@ -472,14 +539,44 @@ def note_error(kind, code):
         log.pop(0)
 
 
+def classify(e):
+    """What kind of failure this was, for the per-source report."""
+    if isinstance(e, urllib.error.HTTPError):
+        return {429: "rate_limited", 403: "blocked_403", 404: "not_found", 410: "not_found"}.get(e.code, f"http_{e.code}")
+    if isinstance(e, TimeoutError) or "timed out" in str(e).lower():
+        return "timeout"
+    if isinstance(e, (json.JSONDecodeError, KeyError, ValueError, TypeError, AttributeError, IndexError)):
+        return "parse_error"
+    if isinstance(e, urllib.error.URLError):
+        return "network_error"
+    return "other_error"
+
+
 def fetch(key):
     kind, b = key
+    tl.kind = kind
     h = health.setdefault(key, {})
     if time.time() < cooldown.get(kind, 0):
         return  # platform is rate-limiting us: skip until the pause ends
     t = time.time()
     try:
-        res = FETCHERS[kind](b)
+        try:
+            raw = FETCHERS[kind](b)
+        except NotModified:  # 304: the board is exactly as we last saw it
+            status["polled"] = int(t)
+            h.update(ok=int(t), ms=int(1000 * (time.time() - t)), unchanged=h.get("unchanged", 0) + 1, fails=0,
+                     status=h.get("status") if h.get("status") in ("ok", "zero_jobs") else "ok")
+            return
+        # Keep internships only. About 97% of postings are full-time roles we never show; holding and re-scanning
+        # them was most of the CPU and RAM. Closed-job detection works on this subset too.
+        res = [j for j in raw if INTERN.search(j["title"])]
+        digest = hash(tuple((j["url"], j["title"], j["location"], j["posted"]) for j in res))
+        status["polled"] = int(t)
+        if key in cache and h.get("digest") == digest:  # same internships as last time: nothing to reprocess
+            h.update(ok=int(t), ms=int(1000 * (time.time() - t)), n=len(raw), status="ok" if raw else "zero_jobs",
+                     unchanged=h.get("unchanged", 0) + 1, fails=0)
+            return
+        h["digest"] = digest
         baseline = key not in cache  # first check of this board: its jobs aren't "new", just newly known
         now = int(time.time())
         for j in res:
@@ -495,11 +592,14 @@ def fetch(key):
         for j in res:
             closed.pop(j["url"], None)  # reposted / reopened
         cache[key] = sharpen(key, res)
-        h.update(ok=int(t), ms=int(1000 * (time.time() - t)), n=len(res))
+        status["polled"] = int(t)
+        h.update(ok=int(t), ms=int(1000 * (time.time() - t)), n=len(raw), interns=len(res), status="ok" if raw else "zero_jobs",
+                 fails=0, changed=h.get("changed", 0) + 1)
+        dirty.set()  # the rebuild thread will pick this up
         backoff[kind] = backoff.get(kind, 0) // 2  # ease back after successes
         return
     except urllib.error.HTTPError as e:
-        h.update(err=int(t), why=f"HTTP {e.code}")
+        h.update(err=int(t), why=f"HTTP {e.code}", status=classify(e))
         if e.code == 429:
             note_error(kind, "429")
             retry_after = e.headers.get("Retry-After", "")
@@ -510,12 +610,12 @@ def fetch(key):
             dead[key] = time.time()  # blocked: respect it, skip this board for DEAD_FOR
         elif e.code in (404, 410):
             note_error(kind, "404")
-            dead[key] = time.time()  # renamed/closed board
+            h["fails"] = h.get("fails", 0) + 1  # renamed/closed board: 3 in a row -> inactive, rechecked weekly
         else:
             note_error(kind, "5xx" if e.code >= 500 else "other")
         return
     except Exception as e:
-        h.update(err=int(t), why=type(e).__name__)
+        h.update(err=int(t), why=f"{type(e).__name__}: {str(e)[:120]}", status=classify(e), fails=h.get("fails", 0) + 1)
         note_error(kind, "other")
         return
 
@@ -549,25 +649,113 @@ def health_report():
     return out
 
 
-def due(key, cycle):
-    """Hot boards every cycle; the long tail staggered across COLD_EVERY cycles; dead boards skipped for a day.
-    ponytail: a long-tail company's *first* SWE posting can wait up to COLD_EVERY cycles; add more workers/servers
-    to lower COLD_EVERY."""
-    if time.time() - dead.get(key, 0) < DEAD_FOR:
-        return False
-    return key in hot or zlib.crc32(repr(key).encode()) % COLD_EVERY == cycle % COLD_EVERY
+# ---------------------------------------------------------------- scheduler
+# Every board has its own next-check time; nothing is checked "all at once". Tiers:
+#   T1  companies that have posted SWE internships (on the board now or before, seeds, watched): every TIER_S[1]
+#   T2  companies that post internships of any kind (on the intern lists, or intern roles seen): every TIER_S[2]
+#   T3  the long tail found by crawling: every TIER_S[3]
+# New boards get a random first slot inside their interval, and every check reschedules with +/-10% jitter, so load
+# spreads evenly across time. Per-platform caps keep throttling platforms (Workday, Workable) polite.
+TIER_S = {1: 60, 2: 240, 3: 900}
+WORKERS = 40  # measured: 24 workers -> 2,050 checks/min at 33% CPU (network-bound); see /api/stats "scheduler"
+PLATFORM_CAP = {"workday": 4, "workable": 2, "recruitee": 2}  # concurrent requests per platform
+INACTIVE_AFTER, INACTIVE_RETRY = 3, 7 * 86400  # 3 failures in a row -> checked weekly instead
+swe_boards = set()  # boards that have ever had a SWE/hidden-SWE internship on the board (-> tier 1)
+next_due, inflight = {}, set()
+sched_lock = threading.Lock()
+
+
+def tier(key):
+    if key in swe_boards or key in SEED_BOARDS or key[0] in ("amazon", "tiktok", "google"):
+        return 1
+    if key in hot or (key in cache and cache[key]):
+        return 2
+    return 3
+
+
+def interval(key):
+    if health.get(key, {}).get("fails", 0) >= INACTIVE_AFTER:
+        return INACTIVE_RETRY
+    if time.time() - dead.get(key, 0) < DEAD_FOR:  # 403: blocked, respect it for a day
+        return DEAD_FOR
+    return TIER_S[tier(key)]
+
+
+def run_board(key):
+    try:
+        fetch(key)
+    finally:
+        with sched_lock:
+            inflight.discard(key)
+            next_due[key] = time.time() + interval(key) * random.uniform(0.9, 1.1)
+
+
+def scheduler():
+    """Feed due boards to a bounded worker pool, oldest-due first, respecting platform caps and rate-limit pauses."""
+    pool, last_scan = ThreadPoolExecutor(WORKERS), 0
+    while True:
+        now = time.time()
+        with sched_lock:
+            if now - last_scan > 30:  # newly discovered boards get a random slot inside their interval
+                last_scan = now
+                for k, bs in list(boards.items()):
+                    for b in bs:
+                        if (k, b) not in next_due:
+                            next_due[(k, b)] = now + random.uniform(0, TIER_S[tier((k, b))])
+            # tier first, then oldest-due: tier 1 is never stuck behind an overdue long tail; lower tiers absorb any lag
+            due_keys = sorted(((t, key) for key, t in next_due.items() if t <= now and key not in inflight),
+                              key=lambda x: (tier(x[1]), x[0]))
+            running = {}
+            for key in inflight:
+                running[key[0]] = running.get(key[0], 0) + 1
+            free = WORKERS - len(inflight)
+            for t, key in due_keys:
+                if free <= 0:
+                    break
+                if now < cooldown.get(key[0], 0):
+                    next_due[key] = cooldown[key[0]] + random.uniform(0, 30)  # platform paused: come back after
+                    continue
+                if running.get(key[0], 0) >= PLATFORM_CAP.get(key[0], WORKERS):
+                    continue
+                inflight.add(key)
+                running[key[0]] = running.get(key[0], 0) + 1
+                free -= 1
+                SCHED["lag_total"] += now - t
+                SCHED["started"] += 1
+                tl_ = SCHED["by_tier"].setdefault(tier(key), [0, 0.0])
+                tl_[0] += 1
+                tl_[1] += now - t
+                pool.submit(run_board, key)
+            SCHED["overdue"] = len(due_keys)
+        time.sleep(0.5)
+
+
+SCHED = {"started": 0, "lag_total": 0.0, "overdue": 0, "by_tier": {}}
+if SOURCES.exists():  # restore SWE history (tier 1) and failure counts from the last run
+    _reg = json.loads(SOURCES.read_text())
+    swe_boards.update(_as_key(k, b) for k, b in _reg.get("swe_boards", []))
+    for k, b, n in _reg.get("fails", []):
+        health.setdefault(_as_key(k, b), {})["fails"] = n
 
 
 def is_swe(j):
+    return _is_swe(j["title"])
+
+
+@functools.lru_cache(maxsize=200_000)  # the same titles come back every rebuild: classify each once
+def _is_swe(t):
     """Title alone is enough: clearly a software role."""
-    t = j["title"]
     return bool(INTERN.search(t) and SWE.search(t) and not NOT_SWE.search(t) and not SOFT.search(t))
 
 
 def is_candidate(j):
+    return _is_candidate(j["title"])
+
+
+@functools.lru_cache(maxsize=200_000)
+def _is_candidate(t):
     """Title might be software (tech programs, or networking/hardware/embedded/firmware/systems roles); the job
     description decides."""
-    t = j["title"]
     if not INTERN.search(t) or NOT_SWE.search(t):
         return False
     if SOFT.search(t):
@@ -643,6 +831,7 @@ def texts(x):
 
 
 def verify(j):
+    tl.kind = "descriptions (" + j["source"] + ")"
     try:
         verdicts[j["url"]] = verdict(" ".join(texts(http(j["detail"]))))
     except urllib.error.HTTPError as e:
@@ -652,6 +841,7 @@ def verify(j):
         pass  # retry next round
 
 
+@functools.lru_cache(maxsize=100_000)
 def domain(company, url):
     """Best guess at the company's website, for its logo. ponytail: name-based guess, wrong for some companies
     (they fall back to a letter badge); a curated name->domain map fixes stragglers."""
@@ -675,7 +865,41 @@ def dedupe_key(j):
     return j["company"].lower(), " ".join(sorted(set(re.findall(r"[a-z0-9+#]+", words)) - NOISE))
 
 
+dirty = threading.Event()  # set whenever board data changes; the rebuild thread picks it up
+REBUILD_EVERY, SAVE_EVERY = 10, 60  # rebuild at most every 10 s, write state files at most every 60 s
+_last_save = [0.0]
+rebuild_lock = threading.Lock()
+
+
+def rebuild_loop():
+    """The only place the board is rebuilt: at most every REBUILD_EVERY seconds, and only when something changed."""
+    while True:
+        dirty.wait()
+        time.sleep(REBUILD_EVERY)
+        dirty.clear()
+        try:
+            rebuild()
+            tl.kind = "ntfy"
+            send_alerts()
+        except Exception as e:
+            print("rebuild failed:", e, flush=True)
+
+
 def rebuild():
+    with rebuild_lock:  # never two at once
+        STATS["rebuilds_running"] += 1
+        if STATS["rebuilds_running"] > 1:
+            STATS["rebuild_overlaps"] += 1
+        t0 = time.time()
+        try:
+            _rebuild()
+        finally:
+            STATS["rebuilds_running"] -= 1
+            STATS["rebuilds"] += 1
+            STATS["rebuild_seconds"] += time.time() - t0
+
+
+def _rebuild():
     global jobs
     out = {}
     # direct-from-company results first so they win dedupe (exact timestamps, canonical links)
@@ -688,7 +912,8 @@ def rebuild():
             activity[j["company"].lower()] = activity.get(j["company"].lower(), 0) + 1
     intern_activity.clear()
     intern_activity.update(activity)
-    hot.update(k for k, r in list(cache.items()) if any(shown(j) for j in r))
+    swe_boards.update(k for k, r in list(cache.items()) if any(shown(j) for j in r))  # -> tier 1
+    STATS["rebuild_jobs_scanned"] += len(direct) + len(lists)
     for j in direct + lists:
         if not shown(j):
             continue
@@ -720,34 +945,38 @@ def rebuild():
             recent.setdefault(j["company"], []).append(j)
     status["batches"] = sorted(({"company": c, "n": len(js), "since": min(j["detected"] for j in js), "domain": js[0]["domain"]}
                                 for c, js in recent.items() if len(js) >= BATCH_MIN), key=lambda b: -b["n"])
-    cutoff = time.time() - 60 * 86400
-    save(SEEN, {u: t for u, t in list(first_seen.items()) if t > cutoff})
-    save(VERDICTS, verdicts)
-    save(DETECTED, {u: t for u, t in list(detected.items()) if t > cutoff or u in live})
-    save(CLOSED, closed)
-    status.update(polled=int(time.time()), boards=sum(map(len, boards.values())) + 1, ok=len(cache))
+    status.update(version=int(time.time() * 1000), boards=sum(map(len, boards.values())) + 1, ok=len(cache))
+    if time.time() - _last_save[0] >= SAVE_EVERY:  # state files: at most once a minute
+        _last_save[0] = time.time()
+        cutoff = time.time() - 60 * 86400
+        save(SEEN, {u: t for u, t in list(first_seen.items()) if t > cutoff})
+        save(VERDICTS, verdicts)
+        save(DETECTED, {u: t for u, t in list(detected.items()) if t > cutoff or u in live})
+        save(CLOSED, closed)
+        save(SOURCES, {"swe_boards": [[k, b] for k, b in swe_boards],
+                       "fails": [[k, b, h["fails"]] for (k, b), h in list(health.items()) if h.get("fails")]})
 
 
-def run_loop(name, kinds, workers):
-    """Refresh the given board kinds forever, at most once per MIN_CYCLE."""
+LISTS_EVERY = 600  # aggregator lists (Simplify, SpeedyApply, vanshb03, GitHub submissions) are fallback coverage
+
+
+def lists_loop():
+    """Refresh the aggregator lists (with ETag: unchanged lists cost a 304) and the set of known boards."""
+    global lists, boards
     while True:
-        start = time.time()
+        t0 = time.time()
         try:
-            if name == "fast":  # the fast loop also refreshes the Simplify lists + board discovery
-                global lists, boards
-                lists, boards = fetch_lists()
-                boards.update(amazon={"amazon"}, tiktok={"tiktok"}, google={"google"})  # single-company sources
-            cycles[name] += 1
-            keys = [(k, b) for k in kinds for b in boards.get(k, ()) if due((k, b), cycles[name])]
-            with ThreadPoolExecutor(workers) as ex:
-                list(ex.map(fetch, keys))
-            rebuild()
-            send_alerts()
-            print(f"{time.strftime('%H:%M:%S')} {name}: {len(keys)} boards in {time.time() - start:.0f}s; "
-                  f"{len(jobs)} SWE internships", flush=True)
+            tl.kind = "aggregator lists"
+            new_lists, new_boards = fetch_lists()
+            new_boards.update(amazon={"amazon"}, tiktok={"tiktok"}, google={"google"})  # single-company sources
+            lists, boards = new_lists, new_boards
+            STATS["lists_seconds_last"] = round(time.time() - t0, 1)
+            dirty.set()
+            print(f"{time.strftime('%H:%M:%S')} lists: {len(lists)} list jobs, {sum(map(len, boards.values()))} boards known",
+                  flush=True)
         except Exception as e:
-            print(f"{name} loop failed:", e, flush=True)
-        time.sleep(max(0, MIN_CYCLE - (time.time() - start)))
+            print("lists loop failed:", e, flush=True)
+        time.sleep(max(60, LISTS_EVERY - (time.time() - t0)))
 
 
 def verify_loop():
@@ -759,7 +988,7 @@ def verify_loop():
         with ThreadPoolExecutor(8) as ex:
             list(ex.map(verify, [j for j in pending if j["source"] not in ("Workday", "Workable")] + slow))
         if pending:
-            rebuild()
+            dirty.set()
             print(f"{time.strftime('%H:%M:%S')} verify: {len(pending)} hidden-SWE descriptions pending, "
                   f"{sum(v['s'] >= SHOW_AT for v in verdicts.values())} SWE-like so far", flush=True)
         time.sleep(20)
@@ -790,6 +1019,7 @@ def signals_loop():
         try:
             if not history:
                 history = build_history()
+            tl.kind = "community signals"
             match = community.company_matcher({j["company"] for j in jobs} | set(history) | set(names.values()))
             items = community.reddit()
             gh, subs = community.github_issues()
@@ -928,6 +1158,42 @@ def send_soon_alerts(alerts):
     save(NOTIFIED, sorted(notified))
 
 
+def sched_report():
+    """How well the scheduler keeps up: boards per tier, target vs achieved interval, overdue backlog."""
+    now, tiers = time.time(), {}
+    for key in list(next_due):
+        t = "inactive" if health.get(key, {}).get("fails", 0) >= INACTIVE_AFTER else tier(key)
+        tiers[t] = tiers.get(t, 0) + 1
+    up = max(1, now - STATS["since"])
+    return {"workers": WORKERS, "inflight": len(inflight), "overdue_now": SCHED["overdue"],
+            "avg_start_lag_s": round(SCHED["lag_total"] / max(1, SCHED["started"]), 1),
+            "checks_per_min": round(SCHED["started"] / up * 60, 1),
+            "avg_start_lag_by_tier_s": {t: round(v[1] / max(1, v[0]), 1) for t, v in SCHED["by_tier"].items()},
+            "boards_by_tier": tiers, "target_interval_s": TIER_S,
+            "demand_checks_per_min": round(sum(n * 60 / TIER_S[t] for t, n in tiers.items() if t in TIER_S), 1)}
+
+
+def stats_report():
+    up = time.time() - STATS["since"]
+    rss = int(open("/proc/self/status").read().split("VmRSS:")[1].split()[0]) // 1024 if os.path.exists("/proc/self/status") else None
+    status = {}
+    for (k, _), h in list(health.items()):
+        c = status.setdefault(k, {})
+        c[h.get("status", "unchecked")] = c.get(h.get("status", "unchecked"), 0) + 1
+    return {"uptime_min": round(up / 60, 1), "rss_mb": rss, "threads": threading.active_count(),
+            "cached_jobs": sum(len(r) for r in list(cache.values())), "boards_in_cache": len(cache),
+            "boards_known": {k: len(v) for k, v in boards.items()}, "source_status": status,
+            "http": {k: {**v, "req_per_min": round(v["requests"] / up * 60, 1), "mb": round(v["bytes"] / 1e6, 1),
+                         "mb_per_min": round(v["bytes"] / 1e6 / up * 60, 2)} for k, v in sorted(STATS["http"].items())},
+            "rebuilds": STATS["rebuilds"], "rebuild_avg_s": round(STATS["rebuild_seconds"] / max(1, STATS["rebuilds"]), 2),
+            "rebuild_share_of_time": round(STATS["rebuild_seconds"] / up, 2), "rebuild_overlaps": STATS["rebuild_overlaps"],
+            "rebuild_jobs_scanned_per_run": STATS["rebuild_jobs_scanned"] // max(1, STATS["rebuilds"]),
+            "disk_mb_written": round(STATS["disk_bytes_written"] / 1e6, 1), "disk_writes": STATS["disk_writes"],
+            "lists_seconds_last": STATS.get("lists_seconds_last"),
+            "scheduler": sched_report(),
+            "listings_shown": len(jobs), "companies_shown": len({j["company"].lower() for j in jobs})}
+
+
 class H(BaseHTTPRequestHandler):
     def send(self, body, ctype="application/json"):
         self.send_response(200)
@@ -937,12 +1203,21 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.startswith("/api/jobs"):
-            if self.path.endswith(f"?v={status['polled']}"):  # page already has this version: nothing to send
+            if self.path.endswith(f"?v={status.get('version')}"):  # page already has this version: nothing to send
                 self.send_response(204)
+                self.send_header("X-Polled", str(status.get("polled", 0)))  # keeps "Updated Xs ago" live
                 return self.end_headers()
             self.send(json.dumps({**status, "jobs": jobs}).encode())
         elif self.path == "/api/soon":
             self.send(json.dumps(likely_soon()).encode())
+        elif self.path == "/api/stats":
+            self.send(json.dumps(stats_report()).encode())
+        elif self.path == "/api/sources":  # every source's last outcome, failures included (CSV)
+            rows = ["kind,board,status,jobs,last_ok,last_error,detail"]
+            for (k, b), h in sorted(health.items(), key=lambda x: (x[0][0], str(x[0][1]))):
+                rows.append(",".join(str(v).replace(",", ";") for v in (k, " / ".join(b) if isinstance(b, tuple) else b,
+                            h.get("status", "unchecked"), h.get("n", ""), h.get("ok", ""), h.get("err", ""), h.get("why", ""))))
+            self.send("\n".join(rows).encode(), "text/csv; charset=utf-8")
         elif self.path == "/api/health":
             self.send(json.dumps(health_report()).encode())
         elif self.path == "/api/tracker":
@@ -979,10 +1254,10 @@ if __name__ == "__main__":
         ok = ntfy(f"{j['company']}: {j['title']}", f"{j['location'] or 'Location not listed'}\nvia {j['source']} · test alert",
                   click=j["url"], tags=["white_check_mark"], priority=4)
         sys.exit(print(f"sent: {j['company']}: {j['title']} -> {j['url']}" if ok else "not sent (is NTFY_TOPIC set in .env?)"))
-    threading.Thread(target=run_loop, args=("fast", ["greenhouse", "lever", "ashby", "smartrecruiters", "recruitee", "breezy", "gem", "teamtailor", "oracle", "icims", "amazon", "successfactors", "phenom", "jibe", "rippling", "tiktok", "google"], 64), daemon=True).start()
-    threading.Thread(target=run_loop, args=("workable", ["workable"], 2), daemon=True).start()  # Cloudflare 1015s above that
+    threading.Thread(target=lists_loop, daemon=True).start()
+    threading.Thread(target=scheduler, daemon=True).start()
+    threading.Thread(target=rebuild_loop, daemon=True).start()
     threading.Thread(target=verify_loop, daemon=True).start()
     threading.Thread(target=signals_loop, daemon=True).start()
-    threading.Thread(target=run_loop, args=("workday", ["workday"], WORKDAY_WORKERS), daemon=True).start()
     print("http://localhost:8000", flush=True)
     ThreadingHTTPServer(("127.0.0.1", 8000), H).serve_forever()

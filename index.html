@@ -155,6 +155,8 @@ nav button[aria-pressed=true]{background:var(--card);color:var(--fg);box-shadow:
   <p class="mut" id="healthSum"></p>
   <table class="htable"><thead><tr><th>Source</th><th>Known boards</th><th>Checked</th><th>Healthy</th><th>Failing</th><th>Closed (skipped 24h)</th><th>Listings</th><th>Median response</th><th>Last success</th><th>429s (1h)</th><th>403 blocks (1h)</th><th>Other errors (1h)</th><th>Status</th></tr></thead><tbody id="healthRows"></tbody></table>
   <h3 style="margin-top:24px">Failing examples</h3><div id="healthFails" class="mut"></div>
+  <p class="mut">Every source's latest result, failures included: <a href="/api/sources" download="sources.csv">download sources.csv</a> ·
+  resource and scheduler measurements: <a href="/api/stats" target="_blank">/api/stats</a></p>
 </section>
 
 <section id="track" hidden>
@@ -239,8 +241,8 @@ let J = [], S = {}, seen = null, T = [], page = 1, fresh = new Set();
 // ---------- board ----------
 async function loadJobs() {
   try {
-    const r = await fetch('/api/jobs?v=' + (S.polled || 0));
-    if (r.status === 204) return;  // nothing new since last check
+    const r = await fetch('/api/jobs?v=' + (S.version || 0));
+    if (r.status === 204) { S.polled = +r.headers.get('X-Polled') || S.polled; return; }  // list unchanged
     S = await r.json();
     const added = seen ? S.jobs.filter(j => !seen.has(j.url)) : [];
     seen = new Set([...(seen || []), ...S.jobs.map(j => j.url)]);

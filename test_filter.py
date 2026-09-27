@@ -106,3 +106,9 @@ assert ("ashby", "x") in board.dead and board.errlog["ashby"][-1][1] == "403"
 r = board.health_report()
 assert r["lever"]["rate_limited_1h"] == 1 and r["ashby"]["blocked_1h"] == 1 and r["lever"]["paused_until"] > 0
 print("ok")
+
+# scheduler: tier 1 = SWE history; three failures in a row -> checked weekly
+board.swe_boards.add(("greenhouse", "acme")); assert board.tier(("greenhouse", "acme")) == 1
+assert board.tier(("greenhouse", "never-seen-co")) == 3
+board.health[("greenhouse", "gone")] = {"fails": 3}; assert board.interval(("greenhouse", "gone")) == board.INACTIVE_RETRY
+print("ok")
