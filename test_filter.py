@@ -5,7 +5,7 @@ YES = ["Software Engineer Intern", "Intern - Front End Developer", "Software Dev
        "Backend Engineering Intern", "Software Engineering Co-op - Fall 2027", "Winter 2027 Software Developer Co-op", "iOS Engineer Intern", "SDE Intern", "Full Stack Engineering Intern"]
 NO = ["2027 Compliance Analyst Summer Internship Programme", "Mechanical Engineering Intern", "Software Sales Intern",
       "Systems Engineer Intern", "Senior Software Engineer", "Internal Tools Engineer", "Machine Learning Engineer Intern",
-      "Data Engineering Intern", "AI Engineer Intern", "AI Developer Intern", "Data Scientist Intern",
+      "Data Engineering Intern", "AI Engineer Intern", "Data Scientist Intern",
       "Network Engineer Intern", "Engineering Intern (Electrical / Mechanical / GNC / Software)", "Software Asset Management Intern"]
 
 for t in YES:
@@ -22,7 +22,7 @@ for t in ["Technology Analyst Intern", "IT Application Development Intern", "Dig
           "Engineering Intern", "Computer Science Intern", "Technology Development Program Intern"]:
     assert cand(t), t
 for t in ["Software Engineer Intern", "Data Analyst Intern", "IT Help Desk Intern", "Mechanical Engineering Intern",
-          "AI Platform Intern", "Cybersecurity Technology Intern", "Marketing Intern",
+          "Marketing Intern", "Data Scientist Intern", "Machine Learning Research Intern", "SOC Analyst Intern",
           "Technology & Management Consulting Intern", "Methods Engineering Intern",
           "General Internship Application 2027", "Solutions Engineering Intern"]:
     assert not cand(t), t
@@ -127,4 +127,25 @@ c = board.coverage_report()["verified_companies_monitored_directly"]; assert c =
 assert board.us_undergrad({"title": "Software Engineer Intern", "location": "Atlanta, GA"})
 assert not board.us_undergrad({"title": "Software Engineer Intern, PhD", "location": "Atlanta, GA"})
 assert not board.us_undergrad({"title": "Software Engineer Intern", "location": "London, UK"})
+print("ok")
+
+# broader SWE-type scope: data / ML / AI / security engineering go to the description check; analysts/research don't
+for tt in ["Machine Learning Engineer Intern", "Data Engineering Intern", "AI Engineer Intern", "MLOps Intern", "AI Platform Intern"]:
+    assert cand(tt), tt
+for tt in ["Data Analyst Intern", "AI Research Scientist Intern", "Business Intelligence Intern", "GRC Intern - Cybersecurity"]:
+    assert not cand(tt) and not is_swe({"title": tt}), tt
+research = "Conduct research on novel ML methods in Python, publish papers, statistical analysis of experiments, literature review."
+assert not desc_ok(research), desc_score(research)
+print("ok")
+
+# pay status: confirmed paid / confirmed unpaid / unknown (unknown never counted as paid)
+from board import pay_status, note_pay, pay_info
+j1 = {"title": "Software Engineer Intern", "url": "https://x/1"}; note_pay(j1, "Pay range: $38 - $45/hr plus housing stipend")
+j2 = {"title": "Software Engineer Intern", "url": "https://x/2"}; note_pay(j2, "This is an unpaid internship for academic credit only.")
+j3 = {"title": "Software Engineer Intern", "url": "https://x/3"}
+assert pay_status(j1, "") == "paid" and pay_status(j2, "") == "unpaid" and pay_status(j3, "") == "unknown"
+assert pay_status(j3, "$60/hr") == "paid"
+print("ok")
+
+assert is_swe({"title": "AI Developer Intern"})  # a developer role building AI software is in scope
 print("ok")

@@ -78,6 +78,13 @@ nav button[aria-pressed=true]{background:var(--card);color:var(--fg);box-shadow:
 .badge.season{color:var(--mut);background:var(--soft);font-weight:600}
 .badge.hot{color:#ea580c;background:color-mix(in srgb,#ea580c 14%,transparent)}
 .why{font-size:12.5px;color:var(--mut);margin-top:4px}
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px}
+.kpi{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px;display:flex;flex-direction:column;gap:2px}
+.kpi b{font-size:24px}.kpi span{color:var(--mut);font-size:13px}.kpi small{color:var(--mut);font-size:12px}
+.kpi.main{border-color:var(--pri)}.kpi.main b{color:var(--pri)}
+@media(max-width:760px){.kpis{grid-template-columns:1fr 1fr}}
+.badge.pay{color:var(--mut);background:var(--soft)}.badge.pay.paid{color:var(--new);background:color-mix(in srgb,var(--new) 12%,transparent)}
+.badge.pay.unpaid{color:var(--warn);background:color-mix(in srgb,var(--warn) 12%,transparent)}
 .htable{width:100%;border-collapse:collapse;background:var(--card);border-radius:12px;overflow:hidden;font-size:14px}
 .htable th,.htable td{padding:10px 12px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}
 .htable th:first-child,.htable td:first-child{text-align:left}.htable th{color:var(--mut);font-weight:600;font-size:12.5px}
@@ -113,7 +120,7 @@ nav button[aria-pressed=true]{background:var(--card);color:var(--fg);box-shadow:
     <span><svg class="i" style="color:#f59e0b"><use href="#i-spark"/></svg><b id="nNew">–</b> new in 24h</span>
     <span class="ok"><svg class="i"><use href="#i-ok"/></svg><span id="upd">Loading… first sweep takes ~1 min</span></span>
     <span class="spacer"></span>
-    <span id="boards"></span>
+    <span id="boards"></span><span id="verifiedKpi" title="Companies whose own job board we poll that have posted a US undergrad SWE-type internship"></span>
   </div>
 
   <div id="batches"></div>
@@ -306,6 +313,7 @@ function drawBoard() {
   $('nActive').textContent = J.length.toLocaleString();
   $('nNew').textContent = J.filter(j => now - posted(j) < 86400).length.toLocaleString();
   $('boards').textContent = `${S.ok.toLocaleString()} company job boards`;
+  if (S.verified) $('verifiedKpi').innerHTML = `<b style="color:var(--pri)">${S.verified.toLocaleString()}</b> verified SWE companies`;
   $('showing').textContent = r.length ? `Showing ${from + 1}–${Math.min(from + PER_PAGE, r.length)} of ${r.length.toLocaleString()}` : '';
   $('list').innerHTML = r.slice(from, from + PER_PAGE).map(j => `<article class="job${j.closed ? ' closed' : ''}">
     ${logo(j.company, j.domain)}
@@ -313,7 +321,7 @@ function drawBoard() {
       <div class="title">${esc(j.title)} ${j.closed ? `<span class="badge closedb">Closed ${ago(j.closed)}</span>` : ''}${j.kind === 'swe' && now - j.detected < HOT ? `<span class="badge hot">🔥 Just dropped</span>` : now - posted(j) < 86400 || fresh.has(j.url) ? `<span class="badge">🆕 NEW</span>` : ''}${j.kind === 'tech' ? `<span class="badge tech" title="Title isn't SWE, but the description is software development">Hidden SWE ${j.score ?? ''}%</span>` : ''}${seasonChip(j)}</div>
       <div class="co"><button class="star${W.has(j.company.toLowerCase()) ? ' on' : ''}" data-star="${esc(j.company)}" aria-label="Watch ${esc(j.company)}" title="Watch this company">${W.has(j.company.toLowerCase()) ? '★' : '☆'}</button>${esc(j.company)}
         <span class="src ${AGG.has(j.source) ? 'agg' : 'direct'}" title="${AGG.has(j.source) ? 'Found through an aggregator list; the link still goes to the company\'s own page' : 'Read directly from the company\'s own job system'}">${AGG.has(j.source) ? 'Via ' + esc(j.source) : 'Direct · ' + esc(j.source)}</span></div>
-      <div class="sub">${j.location ? `<span title="${esc(j.location)}">${icon('pin')}${esc(shortLoc(j.location))}</span>` : ''}<span title="${esc(stamp(j))} · via ${esc(j.source)}">${icon('clock')}<span class="ago" data-i="${J.indexOf(j)}">${when(j)}</span>${detNote(j)}</span>${j.salary ? `<span class="pay">${esc(j.salary)}</span>` : ''}</div>
+      <div class="sub">${j.location ? `<span title="${esc(j.location)}">${icon('pin')}${esc(shortLoc(j.location))}</span>` : ''}<span title="${esc(stamp(j))} · via ${esc(j.source)}">${icon('clock')}<span class="ago" data-i="${J.indexOf(j)}">${when(j)}</span>${detNote(j)}</span>${j.salary ? `<span class="pay">${esc(j.salary)}</span>` : j.pay === 'paid' ? '<span class="badge pay paid">Paid</span>' : j.pay === 'unpaid' ? '<span class="badge pay unpaid">Unpaid</span>' : '<span class="badge pay" title="The posting doesn\'t say">Pay unknown</span>'}</div>
       ${j.kind === 'tech' && j.why?.length ? `<div class="why">${j.why.map(esc).join(' · ')}</div>` : ''}
     </div>
     <div class="acts">
@@ -474,8 +482,13 @@ async function loadHealth() {
   const tot = rows.reduce((t, [, r]) => ({ c: t.c + r.checked, h: t.h + r.healthy }), { c: 0, h: 0 });
   try {
     const C = (await (await fetch('/api/stats')).json()).coverage;
-    $('coverage').innerHTML = `<div class="stats" style="margin-bottom:14px"><span><b>${C.verified_companies_monitored_directly.toLocaleString()}</b> verified companies monitored directly</span>
-      <span>${C.companies_with_any_internship_history.toLocaleString()} with any internship history</span><span class="mut">${C.raw_discovered_boards.toLocaleString()} raw discovered boards</span></div>
+    $('coverage').innerHTML = `<div class="kpis">
+      <div class="kpi main"><b>${C.verified_companies_monitored_directly.toLocaleString()}</b><span>verified SWE companies monitored directly</span>
+        <small>${C.verified_confirmed_paid} confirmed paid · ${C.verified_pay_unknown} pay unknown</small></div>
+      <div class="kpi"><b>${C.companies_with_any_internship_history.toLocaleString()}</b><span>companies with any internship history</span></div>
+      <div class="kpi"><b>${C.active_boards.toLocaleString()}</b><span>active boards</span><small>${C.inactive_boards.toLocaleString()} inactive / dead</small></div>
+      <div class="kpi"><b>${C.checked_at_least_once_pct}%</b><span>of boards checked at least once</span><small>${C.boards_checked.toLocaleString()} of ${C.raw_discovered_boards.toLocaleString()} raw discovered</small></div>
+    </div>
       <p class="mut" style="margin-top:-6px">Verified = ${esc(C.definition)}.</p>`;
   } catch {}
   $('healthSum').innerHTML = `<b class="${tot.h / tot.c > .8 ? 'good' : 'bad'}">${tot.h.toLocaleString()} / ${tot.c.toLocaleString()}</b> checked sources healthy · closed boards are skipped for a day, and boards not yet checked are the long tail waiting their turn`;

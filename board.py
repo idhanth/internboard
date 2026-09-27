@@ -45,7 +45,7 @@ def save(path, obj, **kw):
 # Every HTTP request is counted per platform via a thin wrapper around urlopen; the calling thread says which
 # platform it's working for (tl.kind). Plus rebuild timings/overlap and disk writes. Counters reset on restart.
 STATS = {"since": time.time(), "http": {}, "disk_bytes_written": 0, "disk_writes": 0, "rebuilds": 0, "rebuild_seconds": 0.0,
-         "rebuild_jobs_scanned": 0, "rebuild_overlaps": 0, "rebuilds_running": 0, "loops": {}}
+         "rebuild_jobs_scanned": 0, "rebuild_overlaps": 0, "rebuilds_running": 0, "loops": {}, "latency": {}}
 tl = threading.local()
 _urlopen = urllib.request.urlopen
 
@@ -107,17 +107,23 @@ SWE = re.compile(r"software|\bswe\b|\bsde\b|developer|back[- ]?end|front[- ]?end
                  r"|\bios\b|android|mobile (app|dev|eng)|programmer", re.I)
 NOT_SWE = re.compile(r"sales|marketing|recruit|business develop|account(ing|ant)|\bhr\b|legal|developer (relations|advocate)|asset management"
                      r"|mechanical|electrical|civil|manufacturing|field eng|construction|biomedical|sales eng"
-                     r"|\b(ai|ml|data|bi)\b[\s/]*developer", re.I)
+                     r"|\bbi\b[\s/]*developer", re.I)
 # Titles that are often-but-not-always software: never excluded outright, never trusted outright. The job
 # description decides whether the work is mainly software (see desc_score).
 SOFT = re.compile(r"network|hardware|embedded|firmware|\bsystems?\b", re.I)
 # Tech programs that hide SWE work behind broad titles ("Technology Analyst Intern", "IT Application Development
 # Intern", "Engineering Intern"): shown only if the job description reads like software development.
 TECH = re.compile(r"technolog|\btech\b|\bit\b|information (systems|technology)|applications? (dev|eng|sys)|digital|computer science"
-                  r"|\bcs\b|automation|cloud|platform|product eng|devops|site reliability|\bsre\b|engineering intern"
-                  r"|rotational|development program", re.I)
+                  r"|\bcs\b|automation|cloud|platform|infrastructure|product eng|devops|site reliability|\bsre\b|engineering intern"
+                  r"|rotational|development program"
+                  # data / ML / AI / security engineering: in scope only when the description is real software work
+                  r"|data eng|data platform|data infrastructure|machine learning|\bml\b|mlops|\bai\b|artificial intelligence|\bllm"
+                  r"|security eng|security software|product security|application security|appsec|cyber", re.I)
 NOT_TECH = re.compile(r"help ?desk|desktop support|technician|clinical|nurs|pharm|audit|financ|supply chain|hr tech"
-                      r"|\bdata\b|analytics|machine learning|\bai\b|\bml\b|cyber|security"
+                      # analyst roles are out, except bank-style tech programs ("Technology Analyst") - description decides those
+                      r"|(?<!technology )(?<!software )(?<!programmer )(?<!systems )analyst|analytics|data scien|scientist|research|statistic"
+                      r"|business intel|\bbi\b|governance|compliance"
+                      r"|\bgrc\b|\brisk\b|security operations|\bsoc\b|penetration test|threat intel|policy|annotat|labell?ing|prompt writ"
                       r"|consult|methods|property|project delivery|operations|solutions eng|general", re.I)
 LANGS = re.compile(r"python|\bjava\b|c\+\+|c#|\.net|javascript|typescript|golang|\bgo\b|kotlin|swift|rust|ruby|scala", re.I)
 # Strong software signals, grouped so one noisy group can't carry a score on its own.
@@ -134,7 +140,10 @@ SIGNALS = {
 # Signals that the job is mostly something else (IT support, hardware bench work, network admin).
 NOT_SOFTWARE = re.compile(r"help ?desk|troubleshoot\w* (hardware|end[- ]user|laptops|printers)|desktop support|ticketing|imaging"
                           r"|schematics?|\bpcb\b|circuit|oscilloscope|solder\w*|multimeter|\bfpga\b|verilog|vhdl|analog"
-                          r"|cabling|wiring|ccna|routers?\b|switch(es)? config\w*|lan/wan|test equipment|lab equipment", re.I)
+                          r"|cabling|wiring|ccna|routers?\b|switch(es)? config\w*|lan/wan|test equipment|lab equipment"
+                          # analysis / research rather than building software
+                          r"|tableau|power bi|looker|dashboards?|publications?|publish(ing)? (papers|research)|statistical (analysis|model\w*)"
+                          r"|a/b test analysis|literature review", re.I)
 CODE = re.compile("|".join(p.pattern for p in SIGNALS.values()), re.I)
 ATS_HOSTS = re.compile(r"greenhouse|lever\.co|ashbyhq|smartrecruiters|myworkday|icims|workable|jobvite|oraclecloud"
                        r"|eightfold|rippling|applytojob|bamboohr|recruitee|breezy|taleo|successfactors|dayforce|paylocity|adp")
@@ -161,6 +170,10 @@ sig_store = json.loads(SIGNALS_FILE.read_text()) if SIGNALS_FILE.exists() else {
 page_seen = {}
 submissions = []  # "New Internship" GitHub issues: real postings, often before the lists merge them
 intern_activity = {}  # company (lower) -> non-SWE internship roles it detected in the last 30 days
+PAID = re.compile(r"\$\s?\d{2,3}(\.\d{1,2})?\s*(/|per|an)\s*(hr|hour)|\$\s?\d{2,3},\d{3}|hourly (rate|pay|wage)|\bpaid (intern|position|role)"
+                  r"|stipend|salary range|pay range|base pay|compensation range|hourly range", re.I)
+UNPAID = re.compile(r"\bunpaid\b|\bvolunteer\b|academic credit only|for (academic|course) credit|no (monetary )?compensation", re.I)
+pay_info = {}  # job url -> "paid" | "unpaid", from any description text we've seen; absent = unknown
 VERDICTS = HERE / "verdicts2.json"  # hidden-SWE job url -> {"s": 0-100 score, "why": [matched skills]} (checked once)
 verdicts = json.loads(VERDICTS.read_text()) if VERDICTS.exists() else {}
 hot, dead = set(), {}
@@ -586,6 +599,10 @@ def fetch(key):
                 # first check of a board: its jobs aren't new. Dated ones keep their date; undated ones get 0
                 # ("date unknown") so they never look fresh or trigger alerts/batches.
                 detected[j["url"]] = j["posted"] if baseline else now
+                if not baseline and j["posted"] and not j.get("approx") and 0 <= now - j["posted"] < 7 * 86400:
+                    lat = STATS["latency"].setdefault(kind, [])
+                    lat.append(now - j["posted"])
+                    del lat[:-500]
         if kind in COMPLETE and key in cache:  # jobs that vanished from a complete feed have closed
             gone = {j["url"] for j in cache[key]} - {j["url"] for j in res}
             for j in cache[key]:
@@ -816,9 +833,27 @@ def verdict(text):
     return {"s": s, "why": why}
 
 
+def note_pay(j, text):
+    if text and INTERN.search(j["title"]):
+        text = text if isinstance(text, str) else " ".join(texts(text))
+        if UNPAID.search(text):
+            pay_info[j["url"]] = "unpaid"
+        elif PAID.search(text):
+            pay_info[j["url"]] = "paid"
+
+
+def pay_status(j, salary):
+    """confirmed paid / confirmed unpaid / unknown. Unknown is never treated as paid."""
+    if UNPAID.search(j["title"]) or pay_info.get(j["url"]) == "unpaid":
+        return "unpaid"
+    return "paid" if salary or pay_info.get(j["url"]) == "paid" else "unknown"
+
+
 def tag(j, desc=None, detail=None):
     """For tech-program candidates: judge the description now if the feed includes it, else remember where to
     fetch it (the verifier loop does that once per job)."""
+    if isinstance(desc, str):
+        note_pay(j, desc)
     if is_candidate(j) and j["url"] not in verdicts:
         if isinstance(desc, dict):  # a curated list vouches for it...
             if not (SOFT.search(j["title"]) and not SWE.search(j["title"])):  # ...but "Systems Engineer" needs a description
@@ -845,7 +880,9 @@ def texts(x):
 def verify(j):
     tl.kind = "descriptions (" + j["source"] + ")"
     try:
-        verdicts[j["url"]] = verdict(" ".join(texts(http(j["detail"]))))
+        text = " ".join(texts(http(j["detail"])))
+        note_pay(j, text)
+        verdicts[j["url"]] = verdict(text)
     except urllib.error.HTTPError as e:
         if e.code in (404, 410):
             verdicts[j["url"]] = {"s": 0, "why": []}
@@ -936,6 +973,7 @@ def _rebuild():
             out[k] = {**{f: v for f, v in j.items() if f != "detail"}, "kind": "swe" if SWE.search(j["title"]) else "tech",
                       "score": ver.get("s"), "why": ver.get("why", []), "detected": detected.get(j["url"], j["posted"]),
                       "domain": domain(j["company"], j["url"]), "salary": salaries.get(k) or salaries.get(k[0], "")}
+            out[k]["pay"] = pay_status(j, out[k]["salary"])
         elif (city := re.split(r"[,;(]", j["location"])[0].strip()) \
                 and CITY_ALIAS.get(city.lower(), city.lower())[:6] not in out[k]["location"].lower():  # same role in another city: one card, merged locations
             out[k]["location"] += " · " + city
@@ -958,7 +996,8 @@ def _rebuild():
             recent.setdefault(j["company"], []).append(j)
     status["batches"] = sorted(({"company": c, "n": len(js), "since": min(j["detected"] for j in js), "domain": js[0]["domain"]}
                                 for c, js in recent.items() if len(js) >= BATCH_MIN), key=lambda b: -b["n"])
-    status.update(version=int(time.time() * 1000), boards=sum(map(len, boards.values())) + 1, ok=len(cache))
+    status.update(version=int(time.time() * 1000), boards=sum(map(len, boards.values())) + 1, ok=len(cache),
+                  verified=coverage_report()["verified_companies_monitored_directly"])
     if time.time() - _last_save[0] >= SAVE_EVERY:  # state files: at most once a minute
         _last_save[0] = time.time()
         cutoff = time.time() - 60 * 86400
@@ -1202,7 +1241,17 @@ def coverage_report():
     for k in verified_boards:
         if working(k):
             by_kind.setdefault(k[0], set()).add(canon(k))
-    return {"verified_companies_monitored_directly": len({canon(k) for k in verified_boards if working(k)}),
+    paid_boards = {k for k, r in list(cache.items()) for j in r if pay_status(j, salaries.get(dedupe_key(j), "")) == "paid"}
+    unpaid_only = {k for k in verified_boards if all(pay_status(j, "") == "unpaid" for j in cache.get(k, [])) and cache.get(k)}
+    known = sum(len(v) for v in boards.values())
+    checked = sum(1 for h in list(health.values()) if "ok" in h or "err" in h)
+    inactive = sum(1 for h in list(health.values()) if h.get("fails", 0) >= INACTIVE_AFTER)
+    verified = {canon(k) for k in verified_boards if working(k) and k not in unpaid_only}
+    return {"verified_companies_monitored_directly": len(verified),
+            "verified_confirmed_paid": len({canon(k) for k in verified_boards if working(k) and k in paid_boards}),
+            "verified_pay_unknown": len(verified) - len({canon(k) for k in verified_boards if working(k) and k in paid_boards}),
+            "active_boards": known - inactive, "inactive_boards": inactive,
+            "checked_at_least_once_pct": round(100 * checked / max(1, known), 1), "boards_checked": checked,
             "verified_by_platform": {k: len(v) for k, v in sorted(by_kind.items(), key=lambda x: -len(x[1]))},
             "companies_with_any_internship_history": len({canon(k) for k in intern_boards}),
             "raw_discovered_boards": sum(len(v) for v in boards.values()),
@@ -1229,7 +1278,9 @@ def stats_report():
             "lists_seconds_last": STATS.get("lists_seconds_last"),
             "scheduler": sched_report(),
             "listings_shown": len(jobs), "companies_shown": len({j["company"].lower() for j in jobs}),
-            "coverage": coverage_report()}
+            "coverage": coverage_report(),
+            "detection_latency_s": {k: {"n": len(v), "median": sorted(v)[len(v) // 2], "p95": sorted(v)[int(len(v) * .95)]}
+                                    for k, v in STATS["latency"].items() if v}}
 
 
 class H(BaseHTTPRequestHandler):
