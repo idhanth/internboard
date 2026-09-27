@@ -152,6 +152,7 @@ nav button[aria-pressed=true]{background:var(--card);color:var(--fg);box-shadow:
 </section>
 
 <section id="health" hidden>
+  <div id="coverage"></div>
   <p class="mut" id="healthSum"></p>
   <table class="htable"><thead><tr><th>Source</th><th>Known boards</th><th>Checked</th><th>Healthy</th><th>Failing</th><th>Closed (skipped 24h)</th><th>Listings</th><th>Median response</th><th>Last success</th><th>429s (1h)</th><th>403 blocks (1h)</th><th>Other errors (1h)</th><th>Status</th></tr></thead><tbody id="healthRows"></tbody></table>
   <h3 style="margin-top:24px">Failing examples</h3><div id="healthFails" class="mut"></div>
@@ -471,6 +472,12 @@ setInterval(() => loadSoon(!$('soon').hidden ? false : true), 60000);
 async function loadHealth() {
   const H = await (await fetch('/api/health')).json(), rows = Object.entries(H).sort((a, b) => b[1].known - a[1].known);
   const tot = rows.reduce((t, [, r]) => ({ c: t.c + r.checked, h: t.h + r.healthy }), { c: 0, h: 0 });
+  try {
+    const C = (await (await fetch('/api/stats')).json()).coverage;
+    $('coverage').innerHTML = `<div class="stats" style="margin-bottom:14px"><span><b>${C.verified_companies_monitored_directly.toLocaleString()}</b> verified companies monitored directly</span>
+      <span>${C.companies_with_any_internship_history.toLocaleString()} with any internship history</span><span class="mut">${C.raw_discovered_boards.toLocaleString()} raw discovered boards</span></div>
+      <p class="mut" style="margin-top:-6px">Verified = ${esc(C.definition)}.</p>`;
+  } catch {}
   $('healthSum').innerHTML = `<b class="${tot.h / tot.c > .8 ? 'good' : 'bad'}">${tot.h.toLocaleString()} / ${tot.c.toLocaleString()}</b> checked sources healthy · closed boards are skipped for a day, and boards not yet checked are the long tail waiting their turn`;
   $('healthRows').innerHTML = rows.map(([k, r]) => `<tr><td><b>${k}</b></td><td>${r.known.toLocaleString()}</td><td>${r.checked.toLocaleString()}</td>
     <td class="good">${r.healthy.toLocaleString()}</td><td class="${r.failing ? 'bad' : ''}">${r.failing.toLocaleString()}</td><td>${r.dead.toLocaleString()}</td>

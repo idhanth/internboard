@@ -665,6 +665,7 @@ PLATFORM_CAP = {"workday": 4, "workable": 2, "recruitee": 2}  # concurrent reque
 INACTIVE_AFTER, INACTIVE_RETRY = 3, 7 * 86400  # 3 failures in a row -> checked weekly instead
 swe_boards = set()  # boards that have ever had a SWE/hidden-SWE internship on the board (-> tier 1)
 intern_boards = set()  # boards that have ever had any internship posting (-> never tier 4)
+verified_boards = set()  # boards that have had a US, undergrad-eligible, SWE internship (the number that matters)
 next_due, inflight = {}, set()
 sched_lock = threading.Lock()
 
@@ -744,6 +745,7 @@ if SOURCES.exists():  # restore SWE history (tier 1) and failure counts from the
     _reg = json.loads(SOURCES.read_text())
     swe_boards.update(_as_key(k, b) for k, b in _reg.get("swe_boards", []))
     intern_boards.update(_as_key(k, b) for k, b in _reg.get("intern_boards", []))
+    verified_boards.update(_as_key(k, b) for k, b in _reg.get("verified_boards", []))
     for k, b, n in _reg.get("fails", []):
         health.setdefault(_as_key(k, b), {})["fails"] = n
 
@@ -923,6 +925,7 @@ def _rebuild():
     intern_activity.clear()
     intern_activity.update(activity)
     swe_boards.update(k for k, r in list(cache.items()) if any(shown(j) for j in r))  # -> tier 1
+    verified_boards.update(k for k, r in list(cache.items()) if any(shown(j) and us_undergrad(j) for j in r))
     STATS["rebuild_jobs_scanned"] += len(direct) + len(lists)
     for j in direct + lists:
         if not shown(j):
@@ -964,6 +967,7 @@ def _rebuild():
         save(DETECTED, {u: t for u, t in list(detected.items()) if t > cutoff or u in live})
         save(CLOSED, closed)
         save(SOURCES, {"swe_boards": [[k, b] for k, b in swe_boards], "intern_boards": [[k, b] for k, b in intern_boards],
+                       "verified_boards": [[k, b] for k, b in verified_boards],
                        "fails": [[k, b, h["fails"]] for (k, b), h in list(health.items()) if h.get("fails")]})
 
 
@@ -1184,6 +1188,28 @@ def sched_report():
             "demand_checks_per_min": round(sum(n * 60 / TIER_S[t] for t, n in tiers.items() if t in TIER_S), 1)}
 
 
+def us_undergrad(j):
+    """US (or unspecified) location and not grad-only. Paid isn't verifiable from most postings yet: assumed."""
+    loc = j.get("location", "")
+    return (not loc or (US.search(loc) and not NON_US.search(loc))) and not GRAD.search(j["title"])
+
+
+def coverage_report():
+    """The number that matters, kept apart from raw discovered boards."""
+    working = lambda k: health.get(k, {}).get("ok", 0) >= health.get(k, {}).get("err", 0) and "ok" in health.get(k, {})
+    canon = lambda k: re.sub(r"[^a-z0-9]", "", names.get(k, k[1] if isinstance(k[1], str) else k[1][0]).lower())
+    by_kind = {}
+    for k in verified_boards:
+        if working(k):
+            by_kind.setdefault(k[0], set()).add(canon(k))
+    return {"verified_companies_monitored_directly": len({canon(k) for k in verified_boards if working(k)}),
+            "verified_by_platform": {k: len(v) for k, v in sorted(by_kind.items(), key=lambda x: -len(x[1]))},
+            "companies_with_any_internship_history": len({canon(k) for k in intern_boards}),
+            "raw_discovered_boards": sum(len(v) for v in boards.values()),
+            "definition": "company whose own job board we poll successfully and that has had a US (or unspecified), "
+                          "non-grad-only internship passing the SWE filter; paid assumed unless the posting says unpaid"}
+
+
 def stats_report():
     up = time.time() - STATS["since"]
     rss = int(open("/proc/self/status").read().split("VmRSS:")[1].split()[0]) // 1024 if os.path.exists("/proc/self/status") else None
@@ -1202,7 +1228,8 @@ def stats_report():
             "disk_mb_written": round(STATS["disk_bytes_written"] / 1e6, 1), "disk_writes": STATS["disk_writes"],
             "lists_seconds_last": STATS.get("lists_seconds_last"),
             "scheduler": sched_report(),
-            "listings_shown": len(jobs), "companies_shown": len({j["company"].lower() for j in jobs})}
+            "listings_shown": len(jobs), "companies_shown": len({j["company"].lower() for j in jobs}),
+            "coverage": coverage_report()}
 
 
 class H(BaseHTTPRequestHandler):

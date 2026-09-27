@@ -118,3 +118,13 @@ board.health[("breezy", "no-interns")] = {"ok": 1}; assert board.tier(("breezy",
 assert board.tier(("breezy", "unchecked-yet")) == 3
 board.intern_boards.add(("breezy", "had-one")); board.health[("breezy", "had-one")] = {"ok": 1}; assert board.tier(("breezy", "had-one")) == 3
 print("ok")
+
+# verified coverage: counts a company once, only if its own board works and it had a US undergrad SWE internship
+board.names[("greenhouse", "acme")] = "Acme"; board.health[("greenhouse", "acme")] = {"ok": 5}
+board.verified_boards.add(("greenhouse", "acme")); board.verified_boards.add(("greenhouse", "dead-co"))
+board.health[("greenhouse", "dead-co")] = {"err": 5}
+c = board.coverage_report()["verified_companies_monitored_directly"]; assert c == 1, c
+assert board.us_undergrad({"title": "Software Engineer Intern", "location": "Atlanta, GA"})
+assert not board.us_undergrad({"title": "Software Engineer Intern, PhD", "location": "Atlanta, GA"})
+assert not board.us_undergrad({"title": "Software Engineer Intern", "location": "London, UK"})
+print("ok")
