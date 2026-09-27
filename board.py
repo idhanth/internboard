@@ -10,7 +10,7 @@ Sources:
 Each board is checked on its own schedule by tier (see scheduler()): companies with SWE-internship history every
 minute, other intern-posting companies every 4 min, the long tail every 15 min. Aggregator lists every 10 min.
 """
-import calendar, functools, gzip, html, json, os, random, re, sys, threading, time, urllib.error, urllib.request
+import calendar, functools, gzip, heapq, html, itertools, json, os, queue, random, re, sys, threading, time, urllib.error, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -683,8 +683,17 @@ INACTIVE_AFTER, INACTIVE_RETRY = 3, 7 * 86400  # 3 failures in a row -> checked 
 swe_boards = set()  # boards that have ever had a SWE/hidden-SWE internship on the board (-> tier 1)
 intern_boards = set()  # boards that have ever had any internship posting (-> never tier 4)
 verified_boards = set()  # boards that have had a US, undergrad-eligible, SWE internship (the number that matters)
-next_due, inflight = {}, set()
-sched_lock = threading.Lock()
+# Scheduling state: one min-heap per tier of (due time, seq, board). A board's current due time lives in `due_at`;
+# heap entries that no longer match it are stale and skipped (lazy deletion), so rescheduling is a single O(log n)
+# push. The dispatcher only ever looks at the front of each heap, never at the whole set of boards.
+heaps = {1: [], 2: [], 3: [], 4: []}
+due_at, heap_lock, _seq = {}, threading.Lock(), itertools.count()
+work_q = queue.Queue(maxsize=1)  # hand-off: a board is released only when a worker is free to take it
+running, running_lock = {}, threading.Lock()  # platform -> boards being checked right now
+last_start = {}  # board -> when its previous check started (for the achieved-interval metric)
+inflight = set()  # handed to a worker, not yet rescheduled
+M = {"dispatch_s": [], "dispatched": 0, "worker_idle_s": 0.0, "worker_busy_s": 0.0, "lag": {}, "interval": {}}
+
 
 
 def tier(key):
@@ -705,59 +714,97 @@ def interval(key):
     return TIER_S[tier(key)]
 
 
-def run_board(key):
-    try:
-        fetch(key)
-    finally:
-        with sched_lock:
-            inflight.discard(key)
-            next_due[key] = time.time() + interval(key) * random.uniform(0.9, 1.1)
+def schedule(key, due):
+    with heap_lock:
+        due_at[key] = due
+        heapq.heappush(heaps[tier(key)], (due, next(_seq), key))
 
 
-def scheduler():
-    """Feed due boards to a bounded worker pool, oldest-due first, respecting platform caps and rate-limit pauses."""
-    pool, last_scan = ThreadPoolExecutor(WORKERS), 0
-    while True:
-        now = time.time()
-        with sched_lock:
-            if now - last_scan > 30:  # newly discovered boards get a random slot inside their interval
-                last_scan = now
-                for k, bs in list(boards.items()):
-                    for b in bs:
-                        if (k, b) not in next_due:
-                            next_due[(k, b)] = now + random.uniform(0, TIER_S[tier((k, b))])
-            # tier first, then oldest-due: tier 1 is never stuck behind an overdue long tail; lower tiers absorb any lag
-            due_keys = sorted(((t, key) for key, t in next_due.items() if t <= now and key not in inflight),
-                              key=lambda x: (tier(x[1]), x[0]))
-            running = {}
-            for key in inflight:
-                running[key[0]] = running.get(key[0], 0) + 1
-            free = WORKERS - len(inflight)
-            for t, key in due_keys:
-                if free <= 0:
-                    break
-                if now < cooldown.get(key[0], 0):
-                    next_due[key] = cooldown[key[0]] + random.uniform(0, 30)  # platform paused: come back after
+def _pop_due(now, held):
+    """Next board to check: tier 1 first, then 2, 3, 4; oldest-due first within a tier. Boards whose platform is at
+    its concurrency cap are set aside in `held`; boards on a rate-limited platform are pushed back to its pause end."""
+    with heap_lock:
+        for t in (1, 2, 3, 4):
+            h = heaps[t]
+            while h and h[0][0] <= now:
+                due, _, key = heapq.heappop(h)
+                if due_at.get(key) != due:
+                    continue  # stale entry: the board was rescheduled since
+                kind = key[0]
+                if now < cooldown.get(kind, 0):
+                    due_at[key] = cooldown[kind] + random.uniform(0, 30)
+                    heapq.heappush(heaps[tier(key)], (due_at[key], next(_seq), key))
                     continue
-                if running.get(key[0], 0) >= PLATFORM_CAP.get(key[0], WORKERS):
-                    continue
+                with running_lock:
+                    if running.get(kind, 0) >= PLATFORM_CAP.get(kind, WORKERS):
+                        held.append((t, due, key))
+                        continue
+                    running[kind] = running.get(kind, 0) + 1
+                del due_at[key]
                 inflight.add(key)
-                running[key[0]] = running.get(key[0], 0) + 1
-                free -= 1
-                SCHED["lag_total"] += now - t
-                SCHED["started"] += 1
-                tl_ = SCHED["by_tier"].setdefault(tier(key), [0, 0.0])
-                tl_[0] += 1
-                tl_[1] += now - t
-                pool.submit(run_board, key)
-            SCHED["overdue"] = len(due_keys)
-            SCHED["overdue_by_tier"] = {}
-            for _, key in due_keys:
-                SCHED["overdue_by_tier"][tier(key)] = SCHED["overdue_by_tier"].get(tier(key), 0) + 1
-        time.sleep(0.5)
+                return t, due, key
+    return None
 
 
-SCHED = {"started": 0, "lag_total": 0.0, "overdue": 0, "by_tier": {}}
+def dispatcher():
+    """Release due boards to the workers, one at a time, as workers become free. Sleeps when nothing is due."""
+    while True:
+        t0, now, held = time.perf_counter(), time.time(), []
+        item = _pop_due(now, held)
+        with heap_lock:
+            for t, due, key in held:  # capped platforms keep their place
+                heapq.heappush(heaps[t], (due, next(_seq), key))
+        M["dispatch_s"].append(time.perf_counter() - t0)
+        del M["dispatch_s"][:-2000]
+        if item is None:
+            time.sleep(0.05 if held else 0.25)
+            continue
+        work_q.put(item)  # blocks until a worker takes it: natural back-pressure, no queue of stale work
+        M["dispatched"] += 1
+
+
+def worker():
+    while True:
+        t_idle = time.perf_counter()
+        t, due, key = work_q.get()
+        started = time.perf_counter()
+        M["worker_idle_s"] += started - t_idle
+        now = time.time()
+        lag = M["lag"].setdefault(t, [0, 0.0])
+        lag[0] += 1
+        lag[1] += max(0.0, now - due)
+        if key in last_start:
+            iv = M["interval"].setdefault(t, [0, 0.0])
+            iv[0] += 1
+            iv[1] += now - last_start[key]
+        last_start[key] = now
+        try:
+            fetch(key)
+        finally:
+            with running_lock:
+                running[key[0]] -= 1
+            with heap_lock:
+                inflight.discard(key)
+            schedule(key, time.time() + interval(key) * random.uniform(0.9, 1.1))
+            M["worker_busy_s"] += time.perf_counter() - started
+
+
+def add_new_boards():
+    """Give every board we don't know yet a random first slot inside its tier interval (spreads load evenly)."""
+    now = time.time()
+    with heap_lock:
+        fresh = [(k, b) for k, bs in list(boards.items()) for b in bs if (k, b) not in due_at and (k, b) not in inflight]
+    for key in fresh:
+        schedule(key, now + random.uniform(0, TIER_S[tier(key)]))
+    return len(fresh)
+
+
+def start_scheduler():
+    for _ in range(WORKERS):
+        threading.Thread(target=worker, daemon=True).start()
+    threading.Thread(target=dispatcher, daemon=True).start()
+
+
 if SOURCES.exists():  # restore SWE history (tier 1) and failure counts from the last run
     _reg = json.loads(SOURCES.read_text())
     swe_boards.update(_as_key(k, b) for k, b in _reg.get("swe_boards", []))
@@ -1029,9 +1076,10 @@ def lists_loop():
             new_lists, new_boards = fetch_lists()
             new_boards.update(amazon={"amazon"}, tiktok={"tiktok"}, google={"google"})  # single-company sources
             lists, boards = new_lists, new_boards
+            added = add_new_boards()
             STATS["lists_seconds_last"] = round(time.time() - t0, 1)
             dirty.set()
-            print(f"{time.strftime('%H:%M:%S')} lists: {len(lists)} list jobs, {sum(map(len, boards.values()))} boards known",
+            print(f"{time.strftime('%H:%M:%S')} lists: {len(lists)} list jobs, {sum(map(len, boards.values()))} boards known, {added} newly scheduled",
                   flush=True)
         except Exception as e:
             print("lists loop failed:", e, flush=True)
@@ -1218,19 +1266,28 @@ def send_soon_alerts(alerts):
 
 
 def sched_report():
-    """How well the scheduler keeps up: boards per tier, target vs achieved interval, overdue backlog."""
-    now, tiers = time.time(), {}
-    for key in list(next_due):
-        t = "inactive" if health.get(key, {}).get("fails", 0) >= INACTIVE_AFTER else tier(key)
-        tiers[t] = tiers.get(t, 0) + 1
-    up = max(1, now - STATS["since"])
-    return {"workers": WORKERS, "inflight": len(inflight), "overdue_now": SCHED["overdue"],
-            "overdue_by_tier": SCHED.get("overdue_by_tier", {}),
-            "avg_start_lag_s": round(SCHED["lag_total"] / max(1, SCHED["started"]), 1),
-            "checks_per_min": round(SCHED["started"] / up * 60, 1),
-            "avg_start_lag_by_tier_s": {t: round(v[1] / max(1, v[0]), 1) for t, v in SCHED["by_tier"].items()},
-            "boards_by_tier": tiers, "target_interval_s": TIER_S,
-            "demand_checks_per_min": round(sum(n * 60 / TIER_S[t] for t, n in tiers.items() if t in TIER_S), 1)}
+    """How well the scheduler keeps up: boards and due-now backlog per tier, lag, achieved vs target interval,
+    worker utilisation, dispatcher cost."""
+    now, up = time.time(), max(1, time.time() - STATS["since"])
+    tiers, overdue = {}, {}
+    with heap_lock:
+        for t, h in heaps.items():
+            live = [(d, k) for d, _, k in h if due_at.get(k) == d]
+            tiers[t] = len(live)
+            overdue[t] = sum(1 for d, _ in live if d <= now)
+    inactive = sum(1 for h in list(health.values()) if h.get("fails", 0) >= INACTIVE_AFTER)
+    ds = sorted(M["dispatch_s"]) or [0]
+    busy, idle = M["worker_busy_s"], M["worker_idle_s"]
+    return {"workers": WORKERS, "busy_now": sum(running.values()),
+            "worker_utilisation_pct": round(100 * busy / max(1e-9, busy + idle), 1),
+            "avg_wait_for_next_job_s": round(idle / max(1, M["dispatched"]), 3),
+            "dispatcher_loop_ms": {"avg": round(1000 * sum(ds) / len(ds), 3), "p95": round(1000 * ds[int(len(ds) * .95)], 3)},
+            "checks_per_min": round(M["dispatched"] / up * 60, 1),
+            "boards_by_tier": {**tiers, "inactive (weekly)": inactive}, "overdue_by_tier": overdue,
+            "avg_start_delay_by_tier_s": {t: round(v[1] / max(1, v[0]), 1) for t, v in sorted(M["lag"].items())},
+            "target_interval_s": TIER_S,
+            "achieved_interval_by_tier_s": {t: round(v[1] / max(1, v[0]), 1) for t, v in sorted(M["interval"].items())},
+            "demand_checks_per_min": round(sum(n * 60 / TIER_S[t] for t, n in tiers.items()), 1)}
 
 
 def us_undergrad(j):
@@ -1352,7 +1409,7 @@ if __name__ == "__main__":
                   click=j["url"], tags=["white_check_mark"], priority=4)
         sys.exit(print(f"sent: {j['company']}: {j['title']} -> {j['url']}" if ok else "not sent (is NTFY_TOPIC set in .env?)"))
     threading.Thread(target=lists_loop, daemon=True).start()
-    threading.Thread(target=scheduler, daemon=True).start()
+    start_scheduler()
     threading.Thread(target=rebuild_loop, daemon=True).start()
     threading.Thread(target=verify_loop, daemon=True).start()
     threading.Thread(target=signals_loop, daemon=True).start()
