@@ -677,7 +677,7 @@ def health_report():
 # New boards get a random first slot inside their interval, and every check reschedules with +/-10% jitter, so load
 # spreads evenly across time. Per-platform caps keep throttling platforms (Workday, Workable) polite.
 TIER_S = {1: 60, 2: 240, 3: 900, 4: 3600}
-WORKERS = 40  # measured: 24 workers -> 2,050 checks/min at 33% CPU (network-bound); see /api/stats "scheduler"
+WORKERS = 80  # 2 OCPUs: doubled from 40 (1 OCPU). Measured per run: see bench.py results
 PLATFORM_CAP = {"workday": 4, "workable": 2, "recruitee": 2}  # concurrent requests per platform
 INACTIVE_AFTER, INACTIVE_RETRY = 3, 7 * 86400  # 3 failures in a row -> checked weekly instead
 swe_boards = set()  # boards that have ever had a SWE/hidden-SWE internship on the board (-> tier 1)
