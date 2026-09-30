@@ -8,3 +8,6 @@
 *.err
 __pycache__/
 *.txt
+*.db
+*.db-wal
+*.db-shm

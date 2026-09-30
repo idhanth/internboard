@@ -179,7 +179,8 @@ verdicts = json.loads(VERDICTS.read_text()) if VERDICTS.exists() else {}
 hot, dead = set(), {}
 SOURCES = HERE / "sources.json"  # registry state that must survive restarts: SWE history (tier 1) and failure counts
 _as_key = lambda k, b: (k, tuple(b) if isinstance(b, list) else b)
-shown_urls = {}  # url -> job currently on the board (for closed-job detection)  # boards with SWE intern roles; 404'd boards -> when
+shown_urls = {}  # url -> job currently on the board (for closed-job detection)
+shown_raw = []  # listings that passed the SWE filter, before card-level merging  # boards with SWE intern roles; 404'd boards -> when
 tracker_lock = threading.Lock()
 
 
@@ -1014,9 +1015,11 @@ def _rebuild():
     swe_boards.update(k for k, r in list(cache.items()) if any(shown(j) for j in r))  # -> tier 1
     verified_boards.update(k for k, r in list(cache.items()) if any(shown(j) and us_undergrad(j) for j in r))
     STATS["rebuild_jobs_scanned"] += len(direct) + len(lists)
+    raw = []
     for j in direct + lists:
         if not shown(j):
             continue
+        raw.append(j)
         k = dedupe_key(j)
         if k not in out:
             ver = verdicts.get(j["url"], {}) if not is_swe(j) else {}
@@ -1029,6 +1032,7 @@ def _rebuild():
             out[k]["location"] += " · " + city
         if j.get("terms") and not out[k].get("terms"):  # direct copy wins, but keep the list's season label
             out[k]["terms"] = j["terms"]
+    shown_raw[:] = raw  # every listing that passed the filter, before card merging (for the posting store / dry run)
     live = {j["url"] for j in out.values()}
     now = time.time()
     for u, c in list(closed.items()):  # recently closed roles stay visible (marked) unless a live copy exists
@@ -1365,6 +1369,10 @@ class H(BaseHTTPRequestHandler):
             self.send(json.dumps({**status, "jobs": jobs}).encode())
         elif self.path == "/api/soon":
             self.send(json.dumps(likely_soon()).encode())
+        elif self.path == "/api/admin/raw":  # read-only: live listings + alert history, for the dedupe dry run
+            alerted = [u for u in notified if u.startswith("http")]
+            self.send(json.dumps({"listings": [{k: v for k, v in j.items() if k != "detail"} for j in shown_raw],
+                                  "alerted_urls": alerted}).encode())
         elif self.path == "/api/stats":
             self.send(json.dumps(stats_report()).encode())
         elif self.path == "/api/sources":  # every source's last outcome, failures included (CSV)
