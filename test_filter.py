@@ -157,3 +157,23 @@ board._last_save[0] = 0; board.SOURCES = tmp / "sources.json"; board._rebuild()
 reg = _j.loads((tmp / "sources.json").read_text())
 assert ["lever", "persist-me", 123, 0, "ok", 7] in reg["health"], reg["health"][:3]
 print("ok")
+
+# heap scheduler: tier 1 always first, oldest-due within a tier, platform caps respected, stale entries skipped,
+# nothing double-scheduled
+for h in board.heaps.values(): h.clear()
+board.due_at.clear(); board.inflight.clear(); board.running.clear(); board.cooldown.clear()  # earlier rate-limit test paused lever
+now = _t.time()
+board.swe_boards.add(("lever", "t1co")); board.health[("lever", "t3co")] = {}
+board.schedule(("lever", "t3co"), now - 100)   # long overdue, tier 3
+board.schedule(("lever", "t1co"), now - 1)     # just due, tier 1
+first = board._pop_due(now, [])
+assert first[2] == ("lever", "t1co"), first
+board.schedule(("lever", "t3co"), now + 999)   # rescheduled: the old heap entry is now stale
+assert board._pop_due(now, []) is None
+board.PLATFORM_CAP["lever"] = 1                # cap reached (t1co still running) -> held, not dispatched
+board.schedule(("lever", "again"), now - 1)
+held = []
+assert board._pop_due(now, held) is None and held and held[0][2] == ("lever", "again")
+board.boards = {"lever": {"t1co", "brand-new"}}
+assert board.add_new_boards() == 1               # t1co is in flight: not re-added; only the new board is
+print("ok")
