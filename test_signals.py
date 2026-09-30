@@ -33,7 +33,10 @@ now = time.time()
 board.history = {"Acme": now + 3 * 86400 - 365 * 86400 * 0, "Openco": now}
 board.intern_activity = {"acme": 2}
 board.jobs = [{"company": "Openco", "kind": "swe", "posted": now - 86400, "detected": now - 86400, "title": "Software Engineer Intern"}]
-board.sig_store = {x["id"]: x for x in two["signals"]}
+# fresh rumor posts made "now" (the fixed-date posts above are only for date-parsing checks and are now in the past)
+live = post("Capital One SWE intern apps open tomorrow", author="u1") | {"posted": int(now)}
+live2 = post("Cap One internships dropping tomorrow", author="u2") | {"posted": int(now)}
+board.sig_store = {x["id"]: x for x in extract(live, match) + extract(live2, match)}
 r = board.likely_soon()
 names = [c["company"] for c in r["companies"]]
 assert "Openco" not in names, names
